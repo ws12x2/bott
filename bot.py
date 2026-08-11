@@ -56,9 +56,11 @@ ISHGA TUSHIRISH:
 """
 
 import asyncio
+import http.server
 import logging
 import os
 import sqlite3
+import threading
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -2502,8 +2504,55 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Xatolik yuz berdi:", exc_info=context.error)
 
 
+class _HealthCheckHandler(http.server.BaseHTTPRequestHandler):
+    """Render (yoki shunga o'xshash platformalar) 'portni tinglayapsizmi'
+    tekshiruvini qanoatlantirish uchun har qanday so'rovga 200 OK bilan
+    javob beradi. Botning asosiy ishiga (Telegram bilan gaplashish) hech
+    qanday aloqasi yo'q - faqat platforma buni talab qilgani uchun kerak."""
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write("Bot ishlamoqda ✅".encode("utf-8"))
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        pass  # standart HTTP loglarini o'chirib qo'yamiz (keraksiz shovqin)
+
+
+def start_health_check_server():
+    """PORT muhit o'zgaruvchisi berilgan bo'lsa (Render kabi platformalarda
+    avtomatik beriladi), fon rejimida (alohida thread'da) mayda HTTP server
+    ishga tushiradi. Agar PORT berilmagan bo'lsa (masalan kompyuterda sinab
+    ko'rayotganda), umuman hech narsa qilmaydi."""
+    port_raw = os.environ.get("PORT")
+    if not port_raw:
+        return
+    try:
+        port = int(port_raw)
+    except ValueError:
+        logger.warning("PORT muhit o'zgaruvchisi noto'g'ri qiymatga ega: %s", port_raw)
+        return
+
+    def _serve():
+        try:
+            server = http.server.HTTPServer(("0.0.0.0", port), _HealthCheckHandler)
+            logger.info("Health-check HTTP server %s portda ishga tushdi.", port)
+            server.serve_forever()
+        except Exception:
+            logger.exception("Health-check HTTP serverni ishga tushirishda xatolik.")
+
+    thread = threading.Thread(target=_serve, daemon=True)
+    thread.start()
+
+
 def main():
     init_db()
+    start_health_check_server()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     add_conversation = ConversationHandler(
