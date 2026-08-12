@@ -818,8 +818,13 @@ async def track_and_trim(update: Update, context: ContextTypes.DEFAULT_TYPE, sen
 async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/add (yoki /add_game) buyrug'i orqali HAM, admin panelidagi tegishli
     tugma orqali HAM ishga tushishi mumkin. Qaysi trigger ishlatilganiga
-    qarab, post 'movie' yoki 'game' kategoriyasida saqlanadi."""
+    qarab, post 'movie' yoki 'game' kategoriyasida saqlanadi.
+
+    Butun suhbat davomida almashiladigan HAR BIR xabar (admin) 'add_flow_msg_ids'
+    ro'yxatida kuzatib boriladi - post/o'yin to'liq saqlangach, ular barchasi
+    birdek o'chiriladi va faqat yakuniy natija matni qoladi."""
     user_id = update.effective_user.id
+    context.user_data["add_flow_msg_ids"] = []  # yangi sessiya - eski qoldiqlarni tozalaymiz
 
     if update.callback_query:
         query = update.callback_query
@@ -835,6 +840,7 @@ async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{icon} {label.capitalize()}ni yuboring (video, rasm, hujjat, yoki oddiy matn "
             "bo'lishi mumkin).\n\nBekor qilish uchun /cancel yozing."
         )
+        context.user_data["add_flow_msg_ids"].append(query.message.message_id)
         return WAITING_POST
 
     text = (update.message.text or "")
@@ -847,10 +853,12 @@ async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["pending_category"] = category
     label = "o'yin" if category == CATEGORY_GAME else "post"
     icon = "🎮" if category == CATEGORY_GAME else "🎬"
-    await update.message.reply_text(
+    context.user_data["add_flow_msg_ids"].append(update.message.message_id)
+    sent = await update.message.reply_text(
         f"{icon} {label.capitalize()}ni yuboring (video, rasm, hujjat, yoki oddiy matn "
         "bo'lishi mumkin).\n\nBekor qilish uchun /cancel yozing."
     )
+    context.user_data["add_flow_msg_ids"].append(sent.message_id)
     return WAITING_POST
 
 
@@ -858,6 +866,7 @@ async def add_receive_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     preview = make_preview(message)
     category = context.user_data.pop("pending_category", CATEGORY_MOVIE)
+    flow_ids = context.user_data.setdefault("add_flow_msg_ids", [])
 
     # Agar "saqlash guruhi" sozlangan bo'lsa (admin panel orqali yoki kodda),
     # postni ADMIN bilan shaxsiy chatda emas, balki o'sha guruhda saqlaymiz -
@@ -865,6 +874,7 @@ async def add_receive_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # xavfsiz qoladi.
     storage_chat_id = message.chat_id
     storage_message_id = message.message_id
+    copied_to_storage = False
 
     db_group_id = get_storage_chat_id()
     if db_group_id:
@@ -876,17 +886,25 @@ async def add_receive_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             storage_chat_id = db_group_id
             storage_message_id = stored.message_id
+            copied_to_storage = True
         except Exception:
             logger.exception(
                 "Postni saqlash guruhiga (chat_id=%s) nusxalab bo'lmadi - "
                 "asl xabar (admin chatidagi) ishlatiladi.",
                 db_group_id,
             )
-            await update.message.reply_text(
+            warn = await update.message.reply_text(
                 "⚠️ Diqqat: postni saqlash guruhiga nusxalab bo'lmadi (bot guruhda "
                 "admin emasmi yoki guruh o'chirilganmi - tekshiring). Post hozircha "
                 "faqat shu chatda saqlanadi."
             )
+            flow_ids.append(warn.message_id)
+
+    # MUHIM: asl post xabarini FAQAT nusxa muvaffaqiyatli olinganda tozalash
+    # ro'yxatiga qo'shamiz - aks holda bu xabarning O'ZI "baza" bo'lib
+    # qolgani uchun, uni o'chirsak post butunlay ishlamay qoladi.
+    if copied_to_storage:
+        flow_ids.append(message.message_id)
 
     # Postning o'zini vaqtincha saqlab qo'yamiz (kodlar va tugma nomi
     # kelgandan keyin bazaga yozamiz)
@@ -898,12 +916,13 @@ async def add_receive_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
 
     label = "O'yin" if category == CATEGORY_GAME else "Post"
-    await update.message.reply_text(
+    sent = await update.message.reply_text(
         f"✅ {label} qabul qilindi: {preview}\n\n"
         f"Endi shu {label.lower()} uchun kodlarni vergul bilan ajratib yozing.\n"
         "Masalan: 12,avatar,avatr,avatar2\n\n"
         "Bekor qilish uchun /cancel yozing."
     )
+    flow_ids.append(sent.message_id)
     return WAITING_CODES
 
 
@@ -915,23 +934,28 @@ async def add_receive_codes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
+    flow_ids = context.user_data.setdefault("add_flow_msg_ids", [])
+    flow_ids.append(update.message.message_id)
+
     codes = parse_codes(update.message.text or "")
     if not codes:
-        await update.message.reply_text(
+        warn = await update.message.reply_text(
             "❌ Hech qanday kod topilmadi. Kodlarni vergul bilan ajratib yozing, "
             "masalan: 12,avatar,avatr\n\nYoki /cancel bilan bekor qiling."
         )
+        flow_ids.append(warn.message_id)
         return WAITING_CODES
 
     pending["codes"] = codes
 
-    await update.message.reply_text(
+    sent = await update.message.reply_text(
         "✅ Kodlar qabul qilindi.\n\n"
         "Endi shu post uchun TUGMA NOMINI yozing - bu nom "
         f'"{BTN_KINOLAR}" ro\'yxatida shu post tugmasi sifatida chiqadi.\n'
         "Masalan: Avatar: Suvning yo'li (2022)\n\n"
         "Bekor qilish uchun /cancel yozing."
     )
+    flow_ids.append(sent.message_id)
     return WAITING_BUTTON_NAME
 
 
@@ -943,22 +967,27 @@ async def add_receive_button_name(update: Update, context: ContextTypes.DEFAULT_
         )
         return ConversationHandler.END
 
+    flow_ids = context.user_data.setdefault("add_flow_msg_ids", [])
+    flow_ids.append(update.message.message_id)
+
     button_name = (update.message.text or "").strip()
     if not button_name:
-        await update.message.reply_text(
+        warn = await update.message.reply_text(
             "❌ Tugma nomi bo'sh bo'lishi mumkin emas. Iltimos, nom yozing, "
             "yoki /cancel bilan bekor qiling."
         )
+        flow_ids.append(warn.message_id)
         return WAITING_BUTTON_NAME
 
     pending["button_name"] = button_name
 
-    await update.message.reply_text(
+    sent = await update.message.reply_text(
         "🔗 Post ostiga qo'shimcha tugma (masalan kanalga havola) qo'shmoqchimisiz?\n\n"
         "Agar KERAK BO'LMASA - shunchaki 0 yozing.\n"
         "Agar KERAK BO'LSA - havolani yuboring (http:// yoki https:// bilan boshlanishi kerak).\n\n"
         "Bekor qilish uchun /cancel yozing."
     )
+    flow_ids.append(sent.message_id)
     return WAITING_EXTRA_LINK
 
 
@@ -967,6 +996,9 @@ async def add_receive_extra_link(update: Update, context: ContextTypes.DEFAULT_T
     if not pending or "button_name" not in pending:
         await update.message.reply_text("⚠️ Avval /add buyrug'i bilan boshlang.")
         return ConversationHandler.END
+
+    flow_ids = context.user_data.setdefault("add_flow_msg_ids", [])
+    flow_ids.append(update.message.message_id)
 
     text = (update.message.text or "").strip()
 
@@ -977,18 +1009,20 @@ async def add_receive_extra_link(update: Update, context: ContextTypes.DEFAULT_T
         return WAITING_VISIBILITY
 
     if not (text.startswith("http://") or text.startswith("https://")):
-        await update.message.reply_text(
+        warn = await update.message.reply_text(
             "❌ Link http:// yoki https:// bilan boshlanishi kerak.\n"
             "Tugma kerak bo'lmasa - 0 yozing, yoki /cancel bilan bekor qiling."
         )
+        flow_ids.append(warn.message_id)
         return WAITING_EXTRA_LINK
 
     pending["extra_button_url"] = text
 
-    await update.message.reply_text(
+    sent = await update.message.reply_text(
         "✏️ Endi shu tugma uchun NOM yozing (masalan: 📢 Kanalga o'tish):\n\n"
         "Bekor qilish uchun /cancel yozing."
     )
+    flow_ids.append(sent.message_id)
     return WAITING_EXTRA_LINK_NAME
 
 
@@ -998,12 +1032,16 @@ async def add_receive_extra_link_name(update: Update, context: ContextTypes.DEFA
         await update.message.reply_text("⚠️ Avval /add buyrug'i bilan boshlang.")
         return ConversationHandler.END
 
+    flow_ids = context.user_data.setdefault("add_flow_msg_ids", [])
+    flow_ids.append(update.message.message_id)
+
     text = (update.message.text or "").strip()
     if not text:
-        await update.message.reply_text(
+        warn = await update.message.reply_text(
             "❌ Tugma nomi bo'sh bo'lishi mumkin emas. Qaytadan yozing, "
             "yoki /cancel bilan bekor qiling."
         )
+        flow_ids.append(warn.message_id)
         return WAITING_EXTRA_LINK_NAME
 
     pending["extra_button_text"] = text
@@ -1020,16 +1058,21 @@ async def _ask_visibility(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton(VISIBILITY_LABELS[VISIBILITY_ADMIN], callback_data=f"addvis:{VISIBILITY_ADMIN}")],
         ]
     )
-    await update.message.reply_text(
+    sent = await update.message.reply_text(
         "👁 Bu postni KIMLAR ko'ra olsin?\n\n"
         "(VIP bo'lmaganlar bu postni na kod yozib, na \"Barcha postlar\" "
         "ro'yxatida ko'ra olmaydi, agar \"Faqat VIP\" tanlansa)",
         reply_markup=keyboard,
     )
+    context.user_data.setdefault("add_flow_msg_ids", []).append(sent.message_id)
 
 
 async def add_receive_visibility(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin ko'rinish huquqi tugmalaridan birini bosganda ishga tushadi."""
+    """Admin ko'rinish huquqi tugmalaridan birini bosganda ishga tushadi.
+    Post/o'yin bazaga muvaffaqiyatli saqlangach, BUTUN suhbat davomidagi
+    barcha oraliq xabarlar (post, kodlar, tugma nomi, link savollari,
+    ko'rinish huquqi savoli) o'chirib tashlanadi - faqat yakuniy natija
+    (pastda 2 ta navigatsiya tugmasi bilan) qoladi."""
     query = update.callback_query
     await query.answer()
 
@@ -1042,8 +1085,6 @@ async def add_receive_visibility(update: Update, context: ContextTypes.DEFAULT_T
     if visibility not in (VISIBILITY_ALL, VISIBILITY_VIP, VISIBILITY_ADMIN):
         visibility = VISIBILITY_ALL
     pending["visibility"] = visibility
-
-    await query.edit_message_text(f"👁 Tanlandi: {VISIBILITY_LABELS[visibility]}")
 
     post_id = save_post(
         pending["chat_id"],
@@ -1071,13 +1112,67 @@ async def add_receive_visibility(update: Update, context: ContextTypes.DEFAULT_T
         f"Kodlar: {codes_str}\n"
         f"Ko'rish huquqi: {VISIBILITY_LABELS[visibility]}{extra_line}"
     )
-    await query.message.reply_text(text)
+
+    chat_id = query.message.chat_id
+
+    # Butun /add suhbatidagi barcha oraliq xabarlarni o'chiramiz - shu
+    # jumladan "Kimlar ko'rsin?" savolining o'zi ham (query.message).
+    flow_ids = context.user_data.pop("add_flow_msg_ids", [])
+    flow_ids.append(query.message.message_id)
+    for mid in flow_ids:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=mid)
+        except Exception:
+            pass
+
+    nav_keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🔙 Admin panelga qaytish", callback_data="adm:menu")],
+            [InlineKeyboardButton("🏠 Bosh menyuga qaytish", callback_data="adm:backhome")],
+        ]
+    )
+    await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=nav_keyboard)
     return ConversationHandler.END
+
+
+async def adm_backhome_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Yakuniy 'Saqlandi' xabaridagi "🏠 Bosh menyuga qaytish" tugmasi
+    bosilganda ishga tushadi - eski xabarni o'chirib, o'rniga pastdagi
+    doimiy tugmalar (Barcha postlar/VIP/O'yinlar/Mening statusim) bilan
+    birga YANGI "Bosh menyu" xabarini yuboradi. Buni ataylab shunday
+    qilamiz (shunchaki eski xabarni o'chirib qo'ymasdan) - chunki oldingi
+    tajribada, pastdagi klaviatura faqat uni QAYTA BIRIKTIRGAN xabar orqali
+    kafolatlanadi, aks holda ba'zan ko'rinmay qolishi mumkin edi."""
+    query = update.callback_query
+    await query.answer()
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+    await context.bot.send_message(
+        chat_id=query.message.chat_id,
+        text="🏠 Bosh menyu.",
+        reply_markup=main_menu_markup(),
+    )
 
 
 async def add_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("pending_post", None)
-    await update.message.reply_text("Bekor qilindi.")
+    chat_id = update.effective_chat.id
+
+    flow_ids = context.user_data.pop("add_flow_msg_ids", [])
+    for mid in flow_ids:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=mid)
+        except Exception:
+            pass
+
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    await context.bot.send_message(chat_id=chat_id, text="Bekor qilindi.")
     return ConversationHandler.END
 
 
@@ -2690,6 +2785,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_list_page_callback, pattern=r"^listpage:"))
     app.add_handler(CallbackQueryHandler(handle_list_close_callback, pattern=r"^listclose$"))
     app.add_handler(CallbackQueryHandler(adm_menu_callback, pattern=r"^adm:menu$"))
+    app.add_handler(CallbackQueryHandler(adm_backhome_callback, pattern=r"^adm:backhome$"))
     app.add_handler(CallbackQueryHandler(adm_stats_callback, pattern=r"^adm:stats$"))
     app.add_handler(CallbackQueryHandler(adm_users_callback, pattern=r"^adm:users$"))
     app.add_handler(CallbackQueryHandler(adm_users_page_callback, pattern=r"^adm:userspage:\d+$"))
