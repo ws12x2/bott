@@ -115,6 +115,9 @@ VIP_EXPIRED_CODE = "VIP2"  # VIP muddati tugaganda, foydalanuvchiga avtomatik
 
 CATEGORY_MOVIE = "movie"
 CATEGORY_GAME = "game"
+CATEGORY_SYSTEM = "system"  # VIP1/VIP2 kabi "tizim postlari" - hech qanday
+                             # ro'yxatda yoki kod qidiruvida ko'rinmaydi,
+                             # faqat bot avtomatik yuborganda ishlaydi.
 
 VISIBILITY_ALL = "all"       # Hammaga ko'rinadi
 VISIBILITY_VIP = "vip"       # Faqat VIP foydalanuvchilarga
@@ -482,12 +485,17 @@ def filter_rows_by_visibility(rows, viewer_id: int):
 
 
 def get_all_posts():
-    """Barcha postlarni (post_id, nom, kategoriya) ko'rinishida qaytaradi - admin panel uchun."""
+    """
+    Barcha oddiy postlarni (post_id, nom, kategoriya) ko'rinishida qaytaradi -
+    "Postlarni tahrirlash" admin bo'limi uchun. 'system' kategoriyasidagi
+    postlar (VIP1/VIP2 kabi) BU YERGA QO'SHILMAYDI - ular faqat o'zlarining
+    maxsus admin tugmalari (VIP boshlanish/tugash posti) orqali boshqariladi.
+    """
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
         """SELECT post_id, COALESCE(button_name, preview) AS label, COALESCE(category, 'movie')
-           FROM posts ORDER BY post_id"""
+           FROM posts WHERE COALESCE(category, 'movie') != 'system' ORDER BY post_id"""
     )
     rows = cur.fetchall()
     conn.close()
@@ -633,6 +641,96 @@ def get_vip_until(chat_id: int):
     row = cur.fetchone()
     conn.close()
     return row[0] if row else None
+
+
+def get_username(chat_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT username FROM users WHERE chat_id = ?", (chat_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def get_vip_users():
+    """Hozir FAOL VIP statusga ega barcha foydalanuvchilarni (muddati eng
+    yaqin tugaydigani birinchi) qaytaradi: (chat_id, username, vip_until)."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """SELECT chat_id, username, vip_until FROM users
+           WHERE vip_until IS NOT NULL AND vip_until > datetime('now')
+           ORDER BY vip_until ASC"""
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def get_vip_users():
+    """Hozir VIP muddati faol bo'lgan barcha foydalanuvchilarni (chat_id, username, vip_until)
+    ko'rinishida, tugash sanasi bo'yicha o'sish tartibida qaytaradi."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """SELECT chat_id, username, vip_until FROM users
+           WHERE vip_until IS NOT NULL AND vip_until > datetime('now')
+           ORDER BY vip_until ASC"""
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def adjust_vip_days(chat_id: int, delta_days: int) -> bool:
+    """
+    Foydalanuvchining VIP tugash sanasiga berilgan kun sonini qo'shadi
+    (delta_days manfiy bo'lsa - ayiradi). Agar hozircha VIP bo'lmasa,
+    hozirgi vaqtdan boshlab hisoblanadi.
+
+    - Agar muddat UZAYTIRILSA (delta_days > 0): 'vip_channel_removed'
+      bayrog'i 0 ga qaytariladi - shunda kelajakda bu YANGI muddat ham
+      tugaganda, bot buni albatta payqab, kanaldan chiqarish/VIP2 xabarini
+      yuborishni bajaradi (aks holda eski bayroq saqlanib qolib, ikkinchi
+      marta tugashi butunlay e'tiborsiz qolib ketishi mumkin edi).
+    - Qaytaradi: True - agar shu amaldan keyin VIP muddati o'tib ketgan
+      (darhol tugagan) bo'lsa, aks holda False. Buni chaqiruvchi tomon
+      darhol _process_single_vip_expiry chaqirish uchun ishlatishi kerak.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT vip_until FROM users WHERE chat_id = ?", (chat_id,))
+    row = cur.fetchone()
+    current = row[0] if row else None
+    modifier = f"{delta_days:+d} days"
+
+    if current:
+        cur.execute("UPDATE users SET vip_until = datetime(vip_until, ?) WHERE chat_id = ?", (modifier, chat_id))
+    else:
+        cur.execute("UPDATE users SET vip_until = datetime('now', ?) WHERE chat_id = ?", (modifier, chat_id))
+
+    if delta_days > 0:
+        cur.execute("UPDATE users SET vip_channel_removed = 0 WHERE chat_id = ?", (chat_id,))
+
+    cur.execute(
+        "SELECT vip_until IS NOT NULL AND vip_until <= datetime('now') FROM users WHERE chat_id = ?",
+        (chat_id,),
+    )
+    row2 = cur.fetchone()
+    became_expired = bool(row2[0]) if row2 else False
+
+    conn.commit()
+    conn.close()
+    return became_expired
+
+
+def revoke_vip(chat_id: int):
+    """Foydalanuvchining VIP statusini butunlay bekor qiladi."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET vip_until = NULL WHERE chat_id = ?", (chat_id,))
+    conn.commit()
+    conn.close()
 
 
 def is_vip(chat_id: int) -> bool:
@@ -1321,8 +1419,11 @@ async def show_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await track_and_trim(update, context, sent)
 
-        # VIP foydalanuvchiga VIP1 kodli postni ham yuboramiz
-        vip_post = await send_post_for_code(VIP_WELCOME_CODE, update.effective_chat.id, context)
+        # VIP foydalanuvchiga VIP1 kodli postni ham yuboramiz (bu "system"
+        # posti, shuning uchun allow_system=True bilan chetlab o'tiladi)
+        vip_post = await send_post_for_code(
+            VIP_WELCOME_CODE, update.effective_chat.id, context, allow_system=True
+        )
         if vip_post not in (None, VIP_REQUIRED):
             await track_and_trim(update, context, vip_post, include_incoming=False)
     else:
@@ -1419,7 +1520,11 @@ WAITING_EDIT_LINK_URL = 101  # Link-tugma URL'ini tahrirlash holati
 WAITING_EDIT_LINK_NAME = 102  # Link-tugma nomini tahrirlash holati
 WAITING_BROADCAST_AUDIENCE = 199  # Reklama auditoriyasini tanlash holati
 WAITING_BROADCAST_POST = 200  # Reklama tarqatish suhbati uchun alohida holat
+WAITING_BROADCAST_LINK = 201  # Reklama uchun link-tugma URL'ini so'rash holati
+WAITING_BROADCAST_LINK_NAME = 202  # Reklama uchun link-tugma nomini so'rash holati
+WAITING_BROADCAST_CONFIRM = 203  # Reklamani yakuniy tasdiqlash holati
 WAITING_VIP_USER, WAITING_VIP_DAYS = 300, 301  # VIP berish suhbati uchun alohida holatlar
+WAITING_VIP_ADJUST_DAYS = 302  # VIP muddatini uzaytirish/qisqartirish uchun alohida holat
 WAITING_DB_GROUP = 400  # Baza guruhini sozlash suhbati uchun alohida holat
 WAITING_VIP_CHANNEL = 500  # VIP kanalni sozlash suhbati uchun alohida holat
 WAITING_VIP_SPECIAL_POST = 600  # VIP1/VIP2 postini sozlash suhbati uchun alohida holat
@@ -1884,24 +1989,147 @@ async def broadcast_choose_audience(update: Update, context: ContextTypes.DEFAUL
 
 
 async def broadcast_receive_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin reklama postini yuborganda - uni tanlangan auditoriyaga tarqatadi."""
+    """Admin reklama postini yuborganda - postni vaqtincha saqlab, link-tugma
+    haqida so'raydi (xuddi oddiy post qo'shishdagi kabi)."""
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
 
     message = update.message
-    admin_chat_id = message.chat_id
-    admin_message_id = message.message_id
+    context.user_data["broadcast_post"] = {
+        "chat_id": message.chat_id,
+        "message_id": message.message_id,
+    }
 
+    await message.reply_text(
+        "🔗 Post ostiga qo'shimcha tugma (masalan kanalga havola) qo'shmoqchimisiz?\n\n"
+        "Agar KERAK BO'LMASA - shunchaki 0 yozing.\n"
+        "Agar KERAK BO'LSA - havolani yuboring (http:// yoki https:// bilan boshlanishi kerak).\n\n"
+        "Bekor qilish uchun /cancel yozing."
+    )
+    return WAITING_BROADCAST_LINK
+
+
+async def broadcast_receive_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pending = context.user_data.get("broadcast_post")
+    if not pending:
+        await update.message.reply_text("⚠️ Sessiya topilmadi. /admin orqali qaytadan boshlang.")
+        return ConversationHandler.END
+
+    text = (update.message.text or "").strip()
+
+    if text == "0":
+        pending["extra_button_text"] = None
+        pending["extra_button_url"] = None
+        await _show_broadcast_preview(update, context)
+        return WAITING_BROADCAST_CONFIRM
+
+    if not (text.startswith("http://") or text.startswith("https://")):
+        await update.message.reply_text(
+            "❌ Link http:// yoki https:// bilan boshlanishi kerak.\n"
+            "Tugma kerak bo'lmasa - 0 yozing, yoki /cancel bilan bekor qiling."
+        )
+        return WAITING_BROADCAST_LINK
+
+    pending["extra_button_url"] = text
+    await update.message.reply_text(
+        "✏️ Endi shu tugma uchun NOM yozing (masalan: 📢 Kanalga o'tish):\n\n"
+        "Bekor qilish uchun /cancel yozing."
+    )
+    return WAITING_BROADCAST_LINK_NAME
+
+
+async def broadcast_receive_link_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pending = context.user_data.get("broadcast_post")
+    if not pending or "extra_button_url" not in pending:
+        await update.message.reply_text("⚠️ Sessiya topilmadi. /admin orqali qaytadan boshlang.")
+        return ConversationHandler.END
+
+    text = (update.message.text or "").strip()
+    if not text:
+        await update.message.reply_text(
+            "❌ Tugma nomi bo'sh bo'lishi mumkin emas. Qaytadan yozing, "
+            "yoki /cancel bilan bekor qiling."
+        )
+        return WAITING_BROADCAST_LINK_NAME
+
+    pending["extra_button_text"] = text
+    await _show_broadcast_preview(update, context)
+    return WAITING_BROADCAST_CONFIRM
+
+
+def _broadcast_link_markup(pending: dict):
+    """pending ma'lumotidan link-tugma uchun InlineKeyboardMarkup quradi (agar bo'lsa)."""
+    if pending.get("extra_button_url"):
+        return InlineKeyboardMarkup(
+            [[InlineKeyboardButton(text=pending["extra_button_text"], url=pending["extra_button_url"])]]
+        )
+    return None
+
+
+async def _show_broadcast_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reklamaning aynan qanday ko'rinishda yuborilishini (tugma bilan yoki
+    tugmasiz) admin uchun oldindan ko'rsatadi va yakuniy tasdiqlashni so'raydi."""
+    pending = context.user_data.get("broadcast_post")
+    audience = context.user_data.get("broadcast_audience", "all")
+    user_ids = get_user_chat_ids_by_audience(audience)
+    label = AUDIENCE_LABELS.get(audience, "foydalanuvchilar")
+    chat_id = update.effective_chat.id
+
+    markup = _broadcast_link_markup(pending)
+
+    # Postning aynan qanday ko'rinishini (link-tugma bilan) oldindan ko'rsatamiz
+    try:
+        await context.bot.copy_message(
+            chat_id=chat_id,
+            from_chat_id=pending["chat_id"],
+            message_id=pending["message_id"],
+            reply_markup=markup,
+        )
+    except Exception:
+        logger.exception("Reklama oldindan ko'rishni ko'rsatishda xatolik.")
+
+    confirm_keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✅ Ha, yuborish", callback_data="adm:bcastconfirm")],
+            [InlineKeyboardButton("❌ Yo'q, bekor qilish", callback_data="adm:bcastcancel")],
+        ]
+    )
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "👆 Reklama AYNAN shu ko'rinishda yuboriladi.\n\n"
+            f"Auditoriya: {label} ({len(user_ids)} ta)\n\n"
+            "Tasdiqlaysizmi?"
+        ),
+        reply_markup=confirm_keyboard,
+    )
+
+
+async def broadcast_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin "✅ Ha, yuborish" tugmasini bosganda - haqiqiy tarqatishni boshlaydi."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+
+    pending = context.user_data.pop("broadcast_post", None)
     audience = context.user_data.pop("broadcast_audience", "all")
+
+    if not pending:
+        await query.edit_message_text("⚠️ Sessiya topilmadi. /admin orqali qaytadan boshlang.")
+        return ConversationHandler.END
+
     user_ids = get_user_chat_ids_by_audience(audience)
     if not user_ids:
         label = AUDIENCE_LABELS.get(audience, "foydalanuvchilar")
-        await message.reply_text(f"⚠️ Hozircha {label} yo'q.")
+        await query.edit_message_text(f"⚠️ Hozircha {label} yo'q.")
         return ConversationHandler.END
 
-    status_msg = await message.reply_text(
-        f"📢 Yuborilmoqda... (0/{len(user_ids)})"
-    )
+    markup = _broadcast_link_markup(pending)
+    admin_chat_id = pending["chat_id"]
+    admin_message_id = pending["message_id"]
+
+    await query.edit_message_text(f"📢 Yuborilmoqda... (0/{len(user_ids)})")
 
     success = 0
     failed = 0
@@ -1912,6 +2140,7 @@ async def broadcast_receive_post(update: Update, context: ContextTypes.DEFAULT_T
                 chat_id=uid,
                 from_chat_id=admin_chat_id,
                 message_id=admin_message_id,
+                reply_markup=markup,
             )
             success += 1
         except Exception:
@@ -1926,11 +2155,11 @@ async def broadcast_receive_post(update: Update, context: ContextTypes.DEFAULT_T
         # Har 20 ta yuborishda holatni yangilab turamiz
         if i % 20 == 0:
             try:
-                await status_msg.edit_text(f"📢 Yuborilmoqda... ({i}/{len(user_ids)})")
+                await query.edit_message_text(f"📢 Yuborilmoqda... ({i}/{len(user_ids)})")
             except Exception:
                 pass
 
-    await status_msg.edit_text(
+    await query.edit_message_text(
         f"✅ Reklama yuborildi!\n"
         f"Muvaffaqiyatli: {success}\n"
         f"Yuborilmadi (bloklangan/o'chirilgan): {failed}"
@@ -1938,27 +2167,140 @@ async def broadcast_receive_post(update: Update, context: ContextTypes.DEFAULT_T
     return ConversationHandler.END
 
 
+async def broadcast_confirm_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin oxirgi tasdiqlashda "❌ Yo'q, bekor qilish" tugmasini bosganda ishga tushadi."""
+    query = update.callback_query
+    await query.answer()
+    context.user_data.pop("broadcast_post", None)
+    context.user_data.pop("broadcast_audience", None)
+    await query.edit_message_text("Bekor qilindi.")
+    return ConversationHandler.END
+
+
 async def broadcast_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("broadcast_audience", None)
+    context.user_data.pop("broadcast_post", None)
     await update.message.reply_text("Bekor qilindi.")
     return ConversationHandler.END
 
 
-# ============ VIP STATUS BERISH (/admin -> ⭐ VIP status berish) ============
+# ============ VIP STATUS BOSHQARUVI (/admin -> ⭐ VIP status berish) ============
+
+async def render_vip_menu(query):
+    """VIP foydalanuvchilar ro'yxatini (tepada 'Yangi VIP' tugmasi bilan) chizadi."""
+    vip_users = get_vip_users()
+
+    keyboard = [[InlineKeyboardButton("🆕 Yangi VIP", callback_data="adm:vipnew")]]
+    for chat_id, username, vip_until in vip_users:
+        label = f"@{username}" if username else str(chat_id)
+        keyboard.append([InlineKeyboardButton(f"⭐ {label}", callback_data=f"adm:vipuser:{chat_id}")])
+    keyboard.append([InlineKeyboardButton("🔙 Orqaga", callback_data="adm:menu")])
+
+    text = (
+        "⭐ VIP foydalanuvchilar:" if vip_users
+        else "⭐ Hozircha faol VIP foydalanuvchilar yo'q."
+    )
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def adm_vip_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin panelda "⭐ VIP status berish" tugmasi bosilganda - VIP ro'yxatini ko'rsatadi."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update.effective_user.id):
+        return
+    await render_vip_menu(query)
+
+
+async def render_vipuser_detail(query, target_chat_id: int):
+    """Bitta VIP foydalanuvchi haqida ma'lumot va boshqaruv tugmalarini chizadi."""
+    username = get_username(target_chat_id)
+    vip_until = get_vip_until(target_chat_id)
+    label = f"@{username}" if username else str(target_chat_id)
+
+    keyboard = [
+        [InlineKeyboardButton("➕ Muddatni uzaytirish", callback_data=f"adm:vipextend:{target_chat_id}")],
+        [InlineKeyboardButton("➖ Muddatni qisqartirish", callback_data=f"adm:vipreduce:{target_chat_id}")],
+        [InlineKeyboardButton("❌ VIP ni bekor qilish", callback_data=f"adm:vipcanceling:{target_chat_id}")],
+        [InlineKeyboardButton("🔙 Orqaga", callback_data="adm:vip")],
+    ]
+    await query.edit_message_text(
+        f"⭐ {label}\nID: {target_chat_id}\nTugash sanasi: {vip_until}",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def adm_vipuser_detail_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ro'yxatdan biror VIP foydalanuvchi tanlanganda - uning ma'lumoti va boshqaruv tugmalari."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update.effective_user.id):
+        return
+
+    target_chat_id = int(query.data.split(":")[2])
+    await render_vipuser_detail(query, target_chat_id)
+
+
+async def vipadjust_back_to_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """VIP muddatini uzaytirish/qisqartirish kutilayotgan holatda "🔙 Orqaga" bosilganda
+    suhbatni bekor qilib, o'sha foydalanuvchi detali sahifasiga qaytaradi."""
+    query = update.callback_query
+    await query.answer()
+    context.user_data.pop("vip_adjust_action", None)
+    context.user_data.pop("vip_adjust_target", None)
+
+    target_chat_id = int(query.data.split(":")[2])
+    await render_vipuser_detail(query, target_chat_id)
+    return ConversationHandler.END
+
+
+async def adm_vipcancel_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """VIP ni bekor qilishdan oldin tasdiqlash so'raydi."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update.effective_user.id):
+        return
+
+    target_chat_id = int(query.data.split(":")[2])
+    keyboard = [
+        [InlineKeyboardButton("✅ Ha, bekor qilish", callback_data=f"adm:vipcanceldo:{target_chat_id}")],
+        [InlineKeyboardButton("🔙 Orqaga", callback_data=f"adm:vipuser:{target_chat_id}")],
+    ]
+    await query.edit_message_text(
+        "⚠️ Haqiqatan ham bu foydalanuvchining VIP statusini butunlay bekor qilmoqchimisiz?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def adm_vipcancel_do_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """VIP ni haqiqatan bekor qiladi (darhol kanaldan chiqarish va VIP2
+    xabarini yuborish bilan birga) va ro'yxatga qaytaradi."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update.effective_user.id):
+        return
+
+    target_chat_id = int(query.data.split(":")[2])
+    revoke_vip(target_chat_id)
+    await _process_single_vip_expiry(context, target_chat_id)
+    await render_vip_menu(query)
+
 
 async def vip_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin "⭐ VIP status berish" tugmasini bosganda ishga tushadi."""
+    """Admin VIP ro'yxatidagi "🆕 Yangi VIP" tugmasini bosganda ishga tushadi."""
     query = update.callback_query
     await query.answer()
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
 
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Orqaga", callback_data="adm:vipback")]])
     await query.edit_message_text(
         "👤 VIP status beriladigan foydalanuvchining ID raqamini yoki "
         "@username'ini yozing.\n\n"
         "Eslatma: foydalanuvchi botga kamida bir marta murojaat qilgan "
         "bo'lishi kerak (aks holda bot uni topa olmaydi).\n\n"
-        "Bekor qilish uchun /cancel yozing."
+        "Bekor qilish uchun /cancel yozing, yoki pastdagi tugmani bosing.",
+        reply_markup=keyboard,
     )
     return WAITING_VIP_USER
 
@@ -1976,9 +2318,11 @@ async def vip_receive_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["vip_target_chat_id"] = chat_id
 
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Orqaga", callback_data="adm:vipback")]])
     await update.message.reply_text(
         "📅 Necha kunga VIP status berilsin? (butun son kiriting, masalan: 30)\n\n"
-        "Bekor qilish uchun /cancel yozing."
+        "Bekor qilish uchun /cancel yozing, yoki pastdagi tugmani bosing.",
+        reply_markup=keyboard,
     )
     return WAITING_VIP_DAYS
 
@@ -2016,10 +2360,10 @@ async def vip_receive_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Endi sizga 🎮 O'yinlar bo'limi ochiq!"
             ),
         )
-        vip_sent = await send_post_for_code(VIP_WELCOME_CODE, chat_id, context)
+        vip_sent = await send_post_for_code(VIP_WELCOME_CODE, chat_id, context, allow_system=True)
         if vip_sent is None or vip_sent == VIP_REQUIRED:
             logger.info(
-                "VIP xush kelibsiz posti (%s) topilmadi - admin uni /add orqali qo'shishi kerak.",
+                "VIP xush kelibsiz posti (%s) topilmadi - admin uni /admin panel orqali qo'shishi kerak.",
                 VIP_WELCOME_CODE,
             )
     except Exception:
@@ -2032,8 +2376,82 @@ async def vip_receive_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+async def vipadjust_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin "➕ Muddatni uzaytirish" yoki "➖ Muddatni qisqartirish" tugmasini bosganda ishga tushadi."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+
+    parts = query.data.split(":")  # "adm:vipextend:123" yoki "adm:vipreduce:123"
+    action = "extend" if parts[1] == "vipextend" else "reduce"
+    target_chat_id = int(parts[2])
+
+    context.user_data["vip_adjust_action"] = action
+    context.user_data["vip_adjust_target"] = target_chat_id
+
+    verb = "qo'shmoqchisiz" if action == "extend" else "ayirmoqchisiz"
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🔙 Orqaga", callback_data=f"adm:vipuser:{target_chat_id}")]]
+    )
+    await query.edit_message_text(
+        f"📅 Necha kun {verb}? (butun son kiriting, masalan: 7)\n\n"
+        "Bekor qilish uchun /cancel yozing, yoki pastdagi tugmani bosing.",
+        reply_markup=keyboard,
+    )
+    return WAITING_VIP_ADJUST_DAYS
+
+
+async def vipadjust_receive_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    if not text.isdigit() or int(text) <= 0:
+        await update.message.reply_text(
+            "❌ Musbat butun son kiriting (masalan: 7), yoki /cancel bilan bekor qiling."
+        )
+        return WAITING_VIP_ADJUST_DAYS
+
+    days = int(text)
+    action = context.user_data.pop("vip_adjust_action", None)
+    target_chat_id = context.user_data.pop("vip_adjust_target", None)
+
+    if action is None or target_chat_id is None:
+        await update.message.reply_text("⚠️ Sessiya topilmadi. /admin orqali qaytadan boshlang.")
+        return ConversationHandler.END
+
+    became_expired = adjust_vip_days(target_chat_id, days if action == "extend" else -days)
+    vip_until = get_vip_until(target_chat_id)
+
+    verb = "uzaytirildi" if action == "extend" else "qisqartirildi"
+    extra_note = ""
+    if became_expired:
+        extra_note = "\n\n⏰ Bu qisqartirish natijasida VIP muddati allaqachon tugadi - foydalanuvchi darhol xabardor qilinmoqda va kanaldan chiqarilmoqda."
+
+    await update.message.reply_text(
+        f"✅ Muddat {verb}!\nFoydalanuvchi: {target_chat_id}\nYangi tugash sanasi: {vip_until}{extra_note}"
+    )
+
+    if became_expired:
+        await _process_single_vip_expiry(context, target_chat_id)
+
+    return ConversationHandler.END
+
+
+async def vip_back_to_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """VIP suhbati davomida (matn kiritish kutilayotganda) "🔙 Orqaga" bosilganda
+    suhbatni bekor qilib, VIP ro'yxatiga qaytaradi."""
+    query = update.callback_query
+    await query.answer()
+    context.user_data.pop("vip_target_chat_id", None)
+    context.user_data.pop("vip_adjust_action", None)
+    context.user_data.pop("vip_adjust_target", None)
+    await render_vip_menu(query)
+    return ConversationHandler.END
+
+
 async def vip_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("vip_target_chat_id", None)
+    context.user_data.pop("vip_adjust_action", None)
+    context.user_data.pop("vip_adjust_target", None)
     await update.message.reply_text("Bekor qilindi.")
     return ConversationHandler.END
 
@@ -2316,8 +2734,8 @@ async def vipspecial_receive(update: Update, context: ContextTypes.DEFAULT_TYPE)
         preview,
         code,
         update.effective_user.id,
-        category=CATEGORY_MOVIE,
-        visibility=VISIBILITY_ALL,
+        category=CATEGORY_SYSTEM,
+        visibility=VISIBILITY_ADMIN,
     )
     save_codes([code], post_id)
 
@@ -2356,16 +2774,55 @@ async def handle_chat_join_request(update: Update, context: ContextTypes.DEFAULT
     # VIP bo'lmasa - hech narsa qilmaymiz, so'rov kutishda (pending) qoladi.
 
 
-async def vip_expiry_job(context: ContextTypes.DEFAULT_TYPE):
+async def _process_single_vip_expiry(context: ContextTypes.DEFAULT_TYPE, uid: int):
     """
-    Doimiy ravishda (job_queue orqali) ishga tushadigan vazifa: VIP muddati
-    o'tgan, lekin hali "qayta ishlanmagan" foydalanuvchilarni topib:
+    Bitta foydalanuvchi uchun "VIP tugadi" holatini qayta ishlaydi:
       1) Agar VIP kanal sozlangan bo'lsa - o'sha kanaldan avtomatik chiqarib
          yuboradi (ban+unban - shunda kelajakda qaytadan qo'shilish so'rovi
          yuborishlari mumkin bo'ladi)
       2) VIP kanal sozlanган-sozlanmaganidan QAT'I NAZAR - foydalanuvchiga
-         xabar va VIP2 kodli postni yuboradi (masalan qayta VIP olish
-         haqida taklif)
+         xabar va VIP2 kodli postni yuboradi
+    Bu funksiya HAM avtomatik (job_queue) HAM qo'lda (admin "Bekor qilish"/
+    "Qisqartirish" tugmalari) VIP tugashi holatlarida ishlatiladi.
+    """
+    vip_channel_id = get_vip_channel_id()
+    if vip_channel_id:
+        try:
+            await context.bot.ban_chat_member(chat_id=vip_channel_id, user_id=uid)
+            await context.bot.unban_chat_member(chat_id=vip_channel_id, user_id=uid, only_if_banned=True)
+        except Exception:
+            # Foydalanuvchi kanalda umuman bo'lmagan bo'lishi mumkin - bu normal holat.
+            logger.info("VIP kanaldan chiqarishda kutilgan xatolik (ehtimol u yerda emas): %s", uid)
+
+    try:
+        await context.bot.send_message(
+            chat_id=uid,
+            text="⏰ VIP tarifingiz muddati tugadi.\n\n"
+                 "Qayta VIP olish uchun admin bilan bog'laning.",
+        )
+        vip2_sent = await send_post_for_code(VIP_EXPIRED_CODE, uid, context, allow_system=True)
+        if vip2_sent in (None, VIP_REQUIRED):
+            logger.info(
+                "VIP2 kodli post topilmadi/yuborilmadi (kod=%s, foydalanuvchi=%s) - "
+                "admin uni /admin panel orqali qo'shishi mumkin.",
+                VIP_EXPIRED_CODE, uid,
+            )
+    except Exception:
+        # Foydalanuvchi botni bloklagan bo'lishi mumkin - bu normal holat.
+        logger.info("VIP tugashi haqida xabar yuborib bo'lmadi: %s", uid)
+
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET vip_channel_removed = 1 WHERE chat_id = ?", (uid,))
+    conn.commit()
+    conn.close()
+
+
+async def vip_expiry_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Doimiy ravishda (job_queue orqali) ishga tushadigan vazifa: VIP muddati
+    o'tgan, lekin hali "qayta ishlanmagan" foydalanuvchilarni topib, har
+    birini _process_single_vip_expiry orqali qayta ishlaydi.
     """
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -2380,51 +2837,34 @@ async def vip_expiry_job(context: ContextTypes.DEFAULT_TYPE):
     if not expired_users:
         return
 
-    vip_channel_id = get_vip_channel_id()
     logger.info("VIP muddati tugagan %d foydalanuvchi qayta ishlanmoqda...", len(expired_users))
 
     for uid in expired_users:
-        if vip_channel_id:
-            try:
-                await context.bot.ban_chat_member(chat_id=vip_channel_id, user_id=uid)
-                await context.bot.unban_chat_member(chat_id=vip_channel_id, user_id=uid, only_if_banned=True)
-            except Exception:
-                # Foydalanuvchi kanalda umuman bo'lmagan bo'lishi mumkin - bu normal holat.
-                logger.info("VIP kanaldan chiqarishda kutilgan xatolik (ehtimol u yerda emas): %s", uid)
-
-        # Foydalanuvchiga VIP tugagani haqida xabar va VIP2 kodli postni yuboramiz
-        try:
-            await context.bot.send_message(
-                chat_id=uid,
-                text="⏰ VIP tarifingiz muddati tugadi.\n\n"
-                     "Qayta VIP olish uchun admin bilan bog'laning.",
-            )
-            vip2_sent = await send_post_for_code(VIP_EXPIRED_CODE, uid, context)
-            if vip2_sent in (None, VIP_REQUIRED):
-                logger.info(
-                    "VIP2 kodli post topilmadi/yuborilmadi (kod=%s, foydalanuvchi=%s) - "
-                    "admin uni /add orqali qo'shishi mumkin.",
-                    VIP_EXPIRED_CODE, uid,
-                )
-        except Exception:
-            # Foydalanuvchi botni bloklagan bo'lishi mumkin - bu normal holat.
-            logger.info("VIP tugashi haqida xabar yuborib bo'lmadi: %s", uid)
-
-        conn = sqlite3.connect(DB_PATH)
-        cur = conn.cursor()
-        cur.execute("UPDATE users SET vip_channel_removed = 1 WHERE chat_id = ?", (uid,))
-        conn.commit()
-        conn.close()
+        await _process_single_vip_expiry(context, uid)
 
 
 VIP_REQUIRED = "VIP_REQUIRED"  # send_post_for_code uchun maxsus qaytariladigan belgi
 
 
-async def send_post_for_code(code: str, target_chat_id: int, context: ContextTypes.DEFAULT_TYPE, reply_markup=None):
+async def send_post_for_code(
+    code: str,
+    target_chat_id: int,
+    context: ContextTypes.DEFAULT_TYPE,
+    reply_markup=None,
+    allow_system: bool = False,
+):
     """Berilgan kodga mos postni topib, target_chat_id'ga yuboradi.
     Muvaffaqiyatli bo'lsa yuborilgan xabar obyektini qaytaradi.
     Agar kod topilmasa yoki yuborishda xatolik bo'lsa - None.
     Agar bu O'YIN posti bo'lib, foydalanuvchida VIP status bo'lmasa - VIP_REQUIRED.
+
+    allow_system=True FAQAT botning o'z ICHKI avtomatik yuborishlarida
+    ishlatiladi (VIP berilganda VIP1, VIP tugaganda VIP2, "Mening statusim"da
+    VIP1 ko'rsatilganda) - bu holatda kategoriya/ko'rinish cheklovlari
+    butunlay chetlab o'tiladi. Oddiy foydalanuvchi kod yozganda yoki
+    ro'yxatdan tanlaganda BU HECH QACHON True bo'lmasligi kerak - aks holda
+    "system" (masalan VIP1/VIP2) postlari oshkor bo'lib qolishi mumkin.
+
     Har bir urinish (topilgan yoki topilmagan) statistika uchun loglanadi."""
     row = get_post_by_code(code)
     log_search(target_chat_id, code, found=(row is not None))
@@ -2434,16 +2874,19 @@ async def send_post_for_code(code: str, target_chat_id: int, context: ContextTyp
 
     chat_id, message_id, preview, extra_button_text, extra_button_url, category, visibility = row
 
-    if category == CATEGORY_GAME and not is_vip(target_chat_id):
-        return VIP_REQUIRED
-
-    if visibility == VISIBILITY_VIP and not is_vip(target_chat_id):
-        return VIP_REQUIRED
-
-    if visibility == VISIBILITY_ADMIN and not is_admin(target_chat_id):
-        # Admin uchun mo'ljallangan post - boshqalarga "umuman mavjud emas"
-        # sifatida ko'rsatiladi (yashirin post).
-        return None
+    if not allow_system:
+        if category == CATEGORY_SYSTEM:
+            # Yashirin tizim posti (masalan VIP1/VIP2) - oddiy kod qidiruvida
+            # yoki ro'yxatda HECH QACHON ko'rinmaydi, "topilmadi" bilan bir xil.
+            return None
+        if category == CATEGORY_GAME and not is_vip(target_chat_id):
+            return VIP_REQUIRED
+        if visibility == VISIBILITY_VIP and not is_vip(target_chat_id):
+            return VIP_REQUIRED
+        if visibility == VISIBILITY_ADMIN and not is_admin(target_chat_id):
+            # Admin uchun mo'ljallangan post - boshqalarga "umuman mavjud emas"
+            # sifatida ko'rsatiladi (yashirin post).
+            return None
 
     # Agar post uchun link-tugma belgilangan bo'lsa, uni ishlatamiz (bitta
     # xabarga faqat bitta reply_markup biriktirish mumkin, shuning uchun bu
@@ -2711,20 +3154,38 @@ def main():
             WAITING_BROADCAST_POST: [
                 MessageHandler(filters.ALL & ~filters.COMMAND, broadcast_receive_post),
             ],
+            WAITING_BROADCAST_LINK: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, broadcast_receive_link),
+            ],
+            WAITING_BROADCAST_LINK_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, broadcast_receive_link_name),
+            ],
+            WAITING_BROADCAST_CONFIRM: [
+                CallbackQueryHandler(broadcast_confirm_callback, pattern=r"^adm:bcastconfirm$"),
+                CallbackQueryHandler(broadcast_confirm_cancel_callback, pattern=r"^adm:bcastcancel$"),
+            ],
         },
         fallbacks=[CommandHandler("cancel", broadcast_cancel)],
     )
 
     vip_conversation = ConversationHandler(
         entry_points=[
-            CallbackQueryHandler(vip_start, pattern=r"^adm:vip$"),
+            CallbackQueryHandler(vip_start, pattern=r"^adm:vipnew$"),
+            CallbackQueryHandler(vipadjust_start, pattern=r"^adm:vipextend:\d+$"),
+            CallbackQueryHandler(vipadjust_start, pattern=r"^adm:vipreduce:\d+$"),
         ],
         states={
             WAITING_VIP_USER: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, vip_receive_user),
+                CallbackQueryHandler(vip_back_to_list, pattern=r"^adm:vipback$"),
             ],
             WAITING_VIP_DAYS: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, vip_receive_days),
+                CallbackQueryHandler(vip_back_to_list, pattern=r"^adm:vipback$"),
+            ],
+            WAITING_VIP_ADJUST_DAYS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, vipadjust_receive_days),
+                CallbackQueryHandler(vipadjust_back_to_user, pattern=r"^adm:vipuser:\d+$"),
             ],
         },
         fallbacks=[CommandHandler("cancel", vip_cancel)],
@@ -2788,6 +3249,10 @@ def main():
     app.add_handler(CallbackQueryHandler(adm_backhome_callback, pattern=r"^adm:backhome$"))
     app.add_handler(CallbackQueryHandler(adm_stats_callback, pattern=r"^adm:stats$"))
     app.add_handler(CallbackQueryHandler(adm_users_callback, pattern=r"^adm:users$"))
+    app.add_handler(CallbackQueryHandler(adm_vip_menu_callback, pattern=r"^adm:vip$"))
+    app.add_handler(CallbackQueryHandler(adm_vipuser_detail_callback, pattern=r"^adm:vipuser:\d+$"))
+    app.add_handler(CallbackQueryHandler(adm_vipcancel_confirm_callback, pattern=r"^adm:vipcanceling:\d+$"))
+    app.add_handler(CallbackQueryHandler(adm_vipcancel_do_callback, pattern=r"^adm:vipcanceldo:\d+$"))
     app.add_handler(CallbackQueryHandler(adm_users_page_callback, pattern=r"^adm:userspage:\d+$"))
     app.add_handler(CallbackQueryHandler(adm_editlist_callback, pattern=r"^adm:editlist$"))
     app.add_handler(CallbackQueryHandler(adm_postdetail_callback, pattern=r"^adm:editpost:\d+$"))
