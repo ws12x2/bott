@@ -3102,6 +3102,11 @@ async def backup_database(context: ContextTypes.DEFAULT_TYPE):
     platformalarda (bepul rejada doimiy fayl xotirasi bo'lmagani uchun)
     bot qayta deploy qilinganda ma'lumotlar YO'QOLIB ketmasligi uchun
     zarur - bot ishga tushganda shu pin qilingan nusxadan tiklanadi.
+
+    Guruh eski zaxira fayllari bilan TO'LIB KETMASLIGI uchun, yangi zaxira
+    muvaffaqiyatli yuklab bo'lingandan KEYIN, undan OLDINGI (eski) zaxira
+    xabari avtomatik o'chiriladi - shunda guruhda doim faqat BITTA (eng
+    so'nggi) zaxira fayli saqlanadi.
     """
     backup_chat_id = _get_backup_chat_id()
     if not backup_chat_id:
@@ -3109,6 +3114,8 @@ async def backup_database(context: ContextTypes.DEFAULT_TYPE):
         return
     if not os.path.exists(DB_PATH):
         return
+
+    previous_backup_message_id = get_setting("last_backup_message_id")
 
     try:
         with open(DB_PATH, "rb") as f:
@@ -3127,6 +3134,19 @@ async def backup_database(context: ContextTypes.DEFAULT_TYPE):
                 "Zaxira xabarini PIN qilib bo'lmadi - botda 'Pin messages' huquqi "
                 "borligini tekshiring (aks holda tiklash ishlamaydi)."
             )
+
+        # Yangi zaxira muvaffaqiyatli yuklandi - endi shu haqidagi ma'lumotni
+        # saqlaymiz va, agar oldingi zaxira bo'lsa, uni guruhdan o'chiramiz.
+        set_setting("last_backup_message_id", str(sent.message_id))
+
+        if previous_backup_message_id:
+            try:
+                await context.bot.delete_message(
+                    chat_id=backup_chat_id, message_id=int(previous_backup_message_id)
+                )
+            except Exception:
+                # Allaqachon o'chirilgan yoki topilmagan bo'lishi mumkin - muammo emas.
+                pass
     except Exception:
         logger.exception("Bazani zaxiralashda xatolik yuz berdi.")
 
