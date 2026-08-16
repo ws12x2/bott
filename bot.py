@@ -3088,10 +3088,86 @@ def start_health_check_server():
     thread.start()
 
 
+def _get_backup_chat_id():
+    """Zaxira nusxa qayerga yuborilishi kerakligini aniqlaydi: avval 'baza
+    guruhi' (agar sozlangan bo'lsa), aks holda birinchi admin bilan shaxsiy
+    chat."""
+    return get_storage_chat_id() or (ADMIN_IDS[0] if ADMIN_IDS else None)
+
+
+async def backup_database(context: ContextTypes.DEFAULT_TYPE):
+    """
+    movies.db faylini (SQLite bazaning o'zini) hujjat sifatida saqlash
+    guruhiga (yoki admin chatiga) yuklaydi va PIN qiladi. Bu Render kabi
+    platformalarda (bepul rejada doimiy fayl xotirasi bo'lmagani uchun)
+    bot qayta deploy qilinganda ma'lumotlar YO'QOLIB ketmasligi uchun
+    zarur - bot ishga tushganda shu pin qilingan nusxadan tiklanadi.
+    """
+    backup_chat_id = _get_backup_chat_id()
+    if not backup_chat_id:
+        logger.warning("Bazani zaxiralash uchun chat topilmadi (baza guruhi ham, admin ham sozlanmagan).")
+        return
+    if not os.path.exists(DB_PATH):
+        return
+
+    try:
+        with open(DB_PATH, "rb") as f:
+            sent = await context.bot.send_document(
+                chat_id=backup_chat_id,
+                document=f,
+                filename="movies_backup.db",
+                caption="🗄 Avtomatik zaxira nusxa (backup) - bu xabarni O'CHIRMANG.",
+            )
+        try:
+            await context.bot.pin_chat_message(
+                chat_id=backup_chat_id, message_id=sent.message_id, disable_notification=True
+            )
+        except Exception:
+            logger.warning(
+                "Zaxira xabarini PIN qilib bo'lmadi - botda 'Pin messages' huquqi "
+                "borligini tekshiring (aks holda tiklash ishlamaydi)."
+            )
+    except Exception:
+        logger.exception("Bazani zaxiralashda xatolik yuz berdi.")
+
+
+async def restore_database_if_needed(bot):
+    """
+    Bot ishga tushganda (post_init bosqichida) chaqiriladi. Agar mahalliy
+    'movies.db' fayli mavjud bo'lmasa yoki bo'sh bo'lsa (yangi/tozalangan
+    fayl tizimi belgisi), saqlash chatida PIN qilingan eng so'nggi zaxira
+    nusxani qidirib, topilsa - yuklab olib, o'rniga qo'yadi.
+    """
+    if os.path.exists(DB_PATH) and os.path.getsize(DB_PATH) > 0:
+        return  # mahalliy baza allaqachon bor - tiklashga hojat yo'q
+
+    backup_chat_id = _get_backup_chat_id()
+    if not backup_chat_id:
+        logger.info("Zaxira manbai sozlanmagan - yangi (bo'sh) baza bilan boshlanadi.")
+        return
+
+    try:
+        chat = await bot.get_chat(backup_chat_id)
+        pinned = chat.pinned_message
+        if pinned is None or pinned.document is None:
+            logger.info("PIN qilingan zaxira topilmadi - yangi (bo'sh) baza bilan boshlanadi.")
+            return
+        file = await bot.get_file(pinned.document.file_id)
+        await file.download_to_drive(DB_PATH)
+        logger.info("✅ Baza muvaffaqiyatli zaxiradan tiklandi (%s).", DB_PATH)
+    except Exception:
+        logger.exception("Bazani tiklashda xatolik - yangi (bo'sh) baza bilan boshlanadi.")
+
+
+async def _post_init(app):
+    """Bot pollingni boshlashdan OLDIN, bir marta ishga tushadigan bosqich."""
+    await restore_database_if_needed(app.bot)
+    init_db()  # tiklangan (yoki yangi) fayl ustida jadvallarni yaratish/migratsiya qilish
+
+
 def main():
-    init_db()
     start_health_check_server()
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(_post_init).build()
 
     add_conversation = ConversationHandler(
         entry_points=[
@@ -3273,11 +3349,15 @@ def main():
     # har soatda bir marta tekshiradi (birinchi tekshiruv 30 soniyadan keyin)
     if app.job_queue is not None:
         app.job_queue.run_repeating(vip_expiry_job, interval=3600, first=30)
+        # Bazani har 10 daqiqada avtomatik zaxiralab turadi (Render kabi
+        # platformalarda doimiy fayl xotirasi bo'lmagani uchun ZARUR -
+        # aks holda qayta deploy qilinganda barcha ma'lumot yo'qolib ketadi).
+        app.job_queue.run_repeating(backup_database, interval=600, first=60)
     else:
         logger.warning(
             "job_queue mavjud emas - VIP muddati tugaganda avtomatik kanaldan "
-            "chiqarish ISHLAMAYDI. `pip install \"python-telegram-bot[job-queue]\"` "
-            "bilan o'rnatishni tekshiring."
+            "chiqarish VA bazani avtomatik zaxiralash ISHLAMAYDI. "
+            "`pip install \"python-telegram-bot[job-queue]\"` bilan o'rnatishni tekshiring."
         )
 
     logger.info("Bot ishga tushdi...")
