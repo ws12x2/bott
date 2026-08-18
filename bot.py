@@ -190,6 +190,9 @@ def _migrate_users_table_if_needed(cur):
     if "vip_channel_removed" not in columns:
         logger.info("'users' jadvaliga 'vip_channel_removed' ustuni qo'shilmoqda...")
         cur.execute("ALTER TABLE users ADD COLUMN vip_channel_removed INTEGER DEFAULT 0")
+    if "ads_excluded" not in columns:
+        logger.info("'users' jadvaliga 'ads_excluded' ustuni qo'shilmoqda...")
+        cur.execute("ALTER TABLE users ADD COLUMN ads_excluded INTEGER DEFAULT 0")
 
 
 def _migrate_posts_table_if_needed(cur):
@@ -255,6 +258,7 @@ def init_db():
             username TEXT,
             vip_until TIMESTAMP,
             vip_channel_removed INTEGER DEFAULT 0,
+            ads_excluded INTEGER DEFAULT 0,
             first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """
@@ -288,15 +292,44 @@ def init_db():
         )
         """
     )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS broadcast_always (
+            chat_id INTEGER PRIMARY KEY,
+            label TEXT,
+            kind TEXT DEFAULT 'user',
+            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS broadcast_always (
+            chat_id INTEGER PRIMARY KEY,
+            label TEXT,
+            kind TEXT DEFAULT 'user',
+            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
     conn.commit()
     conn.close()
 
 
 def get_setting(key: str, default=None):
+    """
+    Sozlamani o'qiydi. Agar 'settings' jadvali hali yaratilmagan bo'lsa
+    (masalan bot birinchi marta, hali init_db() chaqirilmasdan oldin,
+    zaxiradan tiklashga urinayotganda) - xatoga uchramasdan shunchaki
+    standart qiymatni qaytaradi.
+    """
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("SELECT value FROM settings WHERE key = ?", (key,))
-    row = cur.fetchone()
+    try:
+        cur.execute("SELECT value FROM settings WHERE key = ?", (key,))
+        row = cur.fetchone()
+    except sqlite3.OperationalError:
+        row = None
     conn.close()
     return row[0] if row else default
 
@@ -807,19 +840,181 @@ def get_user_chat_ids_by_audience(audience: str):
     """
     Reklama tarqatish uchun foydalanuvchilarni auditoriya bo'yicha filtrlab qaytaradi.
     audience: 'regular' (faqat VIP bo'lmaganlar), 'vip' (faqat VIP'lar), 'all' (hammasi).
-    Har uch holatda ham adminlar chiqarib tashlanadi (o'ziga reklama yubormaslik uchun).
+    Har uch holatda ham adminlar VA "reklama yuborilmaydiganlar" ro'yxatidagi
+    foydalanuvchilar (ads_excluded=1) chiqarib tashlanadi - statusidan qat'i nazar.
     """
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     if audience == "vip":
-        cur.execute("SELECT chat_id FROM users WHERE vip_until IS NOT NULL AND vip_until > datetime('now')")
+        cur.execute(
+            """SELECT chat_id FROM users WHERE vip_until IS NOT NULL AND vip_until > datetime('now')
+               AND COALESCE(ads_excluded, 0) = 0"""
+        )
     elif audience == "regular":
-        cur.execute("SELECT chat_id FROM users WHERE vip_until IS NULL OR vip_until <= datetime('now')")
+        cur.execute(
+            """SELECT chat_id FROM users WHERE (vip_until IS NULL OR vip_until <= datetime('now'))
+               AND COALESCE(ads_excluded, 0) = 0"""
+        )
     else:  # "all"
-        cur.execute("SELECT chat_id FROM users")
+        cur.execute("SELECT chat_id FROM users WHERE COALESCE(ads_excluded, 0) = 0")
     rows = [r[0] for r in cur.fetchall()]
     conn.close()
     return [cid for cid in rows if cid not in ADMIN_IDS]
+
+
+def get_excluded_ads_users():
+    """Reklama yuborilmaydigan (ads_excluded=1) foydalanuvchilarni qaytaradi: (chat_id, username)."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT chat_id, username FROM users WHERE COALESCE(ads_excluded, 0) = 1 ORDER BY chat_id"
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def set_ads_excluded(chat_id: int, excluded: bool):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET ads_excluded = ? WHERE chat_id = ?", (1 if excluded else 0, chat_id))
+    conn.commit()
+    conn.close()
+
+
+def add_always_send(chat_id: int, label: str, kind: str = "user"):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """INSERT INTO broadcast_always (chat_id, label, kind) VALUES (?, ?, ?)
+           ON CONFLICT(chat_id) DO UPDATE SET label = excluded.label, kind = excluded.kind""",
+        (chat_id, label, kind),
+    )
+    conn.commit()
+    conn.close()
+
+
+def remove_always_send(chat_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM broadcast_always WHERE chat_id = ?", (chat_id,))
+    conn.commit()
+    conn.close()
+
+
+def get_always_send_list():
+    """('Doim yuboriladi' ro'yxati) (chat_id, label, kind) - kind: 'user' yoki 'channel'."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT chat_id, label, kind FROM broadcast_always ORDER BY chat_id")
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def get_always_send_chat_ids():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT chat_id FROM broadcast_always")
+    rows = [r[0] for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+def get_broadcast_recipients(audience: str):
+    """
+    Yakuniy reklama qabul qiluvchilar ro'yxati:
+    (auditoriya bo'yicha filtrlangan foydalanuvchilar) + ("Doim yuboriladi"
+    ro'yxatidagilar - foydalanuvchi HAM, kanal HAM bo'lishi mumkin).
+    "Doim yuboriladi" ro'yxati "Reklama yuborilmaydiganlar" cheklovidan ham
+    USTUN turadi - u yerga qo'shilgan chat har doim reklamani oladi.
+    """
+    audience_ids = set(get_user_chat_ids_by_audience(audience))
+    always_ids = set(get_always_send_chat_ids())
+    return sorted(audience_ids | always_ids)
+
+
+async def resolve_broadcast_target(context: ContextTypes.DEFAULT_TYPE, message):
+    """
+    Admin "Doim yuboriladi" ro'yxatiga biror narsa qo'shmoqchi bo'lganda,
+    yuborgan xabarini (forward, @username, havola yoki ID) FOYDALANUVCHI
+    yoki KANAL sifatida aniqlashga harakat qiladi.
+
+    Qaytaradi: (chat_id, label, kind) - muvaffaqiyatli bo'lsa
+               (None, xato_matni, None) - muvaffaqiyatsiz bo'lsa
+    """
+    # 1) Forward qilingan xabar bo'lsa (odatda kanaldan) - undan chat'ni olamiz
+    origin = getattr(message, "forward_origin", None)
+    candidate_chat_id = None
+    if origin is not None and getattr(origin, "chat", None) is not None:
+        candidate_chat_id = origin.chat.id
+    else:
+        fwd_chat = getattr(message, "forward_from_chat", None)
+        if fwd_chat is not None:
+            candidate_chat_id = fwd_chat.id
+
+    if candidate_chat_id is not None:
+        try:
+            chat = await context.bot.get_chat(candidate_chat_id)
+        except Exception:
+            return None, "❌ Bu kanal/guruhni aniqlab bo'lmadi.", None
+        try:
+            member = await context.bot.get_chat_member(candidate_chat_id, context.bot.id)
+            is_chat_admin = member.status in ("administrator", "creator")
+        except Exception:
+            is_chat_admin = False
+        if not is_chat_admin:
+            return None, f"⚠️ Bot \"{chat.title or chat.id}\"da admin emas. Avval botni admin qiling.", None
+        return candidate_chat_id, (chat.title or str(candidate_chat_id)), "channel"
+
+    text = (message.text or "").strip()
+    if not text:
+        return None, "❌ Tushunarsiz format.", None
+
+    # 2) Avval oddiy FOYDALANUVCHI sifatida qidiramiz (ID yoki @username)
+    user_chat_id = find_user_chat_id(text)
+    if user_chat_id is not None:
+        username = get_username(user_chat_id)
+        label = f"@{username}" if username else str(user_chat_id)
+        return user_chat_id, label, "user"
+
+    # 3) Foydalanuvchi topilmasa - KANAL/GURUH sifatida sinab ko'ramiz
+    candidate = None
+    if text.startswith("@"):
+        candidate = text
+    elif "t.me/" in text:
+        path = text.split("t.me/", 1)[1].split("?")[0].strip("/")
+        if path.startswith("+") or path.lower().startswith("joinchat"):
+            return None, (
+                "⚠️ Bu yopiq kanalning shaxsiy taklif havolasi - botlar bunday "
+                "havolalar orqali kanalni aniqlay olmaydi.\n\nIltimos, o'sha "
+                "kanaldan istalgan xabarni shu yerga FORWARD qiling."
+            ), None
+        candidate = f"@{path}"
+    elif text.lstrip("-").isdigit():
+        candidate = int(text)
+
+    if candidate is None:
+        return None, (
+            "❌ Bunday foydalanuvchi topilmadi va bu kanal havolasiga ham "
+            "o'xshamaydi.\n\nID/@username yozing, yoki kanaldan xabar forward qiling."
+        ), None
+
+    try:
+        chat = await context.bot.get_chat(candidate)
+    except Exception:
+        return None, "❌ Bunday foydalanuvchi yoki kanal topilmadi.", None
+
+    try:
+        member = await context.bot.get_chat_member(chat.id, context.bot.id)
+        is_chat_admin = member.status in ("administrator", "creator")
+    except Exception:
+        is_chat_admin = False
+
+    if not is_chat_admin:
+        return None, f"⚠️ Bot \"{chat.title or chat.id}\"da admin emas. Avval botni admin qiling.", None
+
+    return chat.id, (chat.title or str(chat.id)), "channel"
 
 
 def get_users_page(page: int = 0, page_size: int = 20):
@@ -1524,6 +1719,8 @@ WAITING_BROADCAST_LINK = 201  # Reklama uchun link-tugma URL'ini so'rash holati
 WAITING_BROADCAST_LINK_NAME = 202  # Reklama uchun link-tugma nomini so'rash holati
 WAITING_BROADCAST_CONFIRM = 203  # Reklamani yakuniy tasdiqlash holati
 WAITING_VIP_USER, WAITING_VIP_DAYS = 300, 301  # VIP berish suhbati uchun alohida holatlar
+WAITING_ADSEXCL_USER = 210  # Reklama yuborilmaydiganlar ro'yxatiga qo'shish holati
+WAITING_ADSALWAYS_ITEM = 211  # "Doim yuboriladi" ro'yxatiga qo'shish holati
 WAITING_VIP_ADJUST_DAYS = 302  # VIP muddatini uzaytirish/qisqartirish uchun alohida holat
 WAITING_DB_GROUP = 400  # Baza guruhini sozlash suhbati uchun alohida holat
 WAITING_VIP_CHANNEL = 500  # VIP kanalni sozlash suhbati uchun alohida holat
@@ -1958,6 +2155,8 @@ async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("👤 Faqat oddiy foydalanuvchilarga", callback_data="adm:bcast:regular")],
         [InlineKeyboardButton("⭐ Faqat VIP foydalanuvchilarga", callback_data="adm:bcast:vip")],
         [InlineKeyboardButton("📢 Hammaga", callback_data="adm:bcast:all")],
+        [InlineKeyboardButton("🚫 Reklama yuborilmaydiganlar", callback_data="adm:adsexcl")],
+        [InlineKeyboardButton("✅ Doim yuboriladi", callback_data="adm:adsalways")],
     ]
     await query.edit_message_text(
         "📢 Reklamani kimlarga yubormoqchisiz?",
@@ -1976,7 +2175,7 @@ async def broadcast_choose_audience(update: Update, context: ContextTypes.DEFAUL
     audience = query.data.split(":")[2]  # "adm:bcast:regular" -> "regular"
     context.user_data["broadcast_audience"] = audience
 
-    user_ids = get_user_chat_ids_by_audience(audience)
+    user_ids = get_broadcast_recipients(audience)
     label = AUDIENCE_LABELS.get(audience, "foydalanuvchilar")
 
     await query.edit_message_text(
@@ -2071,7 +2270,7 @@ async def _show_broadcast_preview(update: Update, context: ContextTypes.DEFAULT_
     tugmasiz) admin uchun oldindan ko'rsatadi va yakuniy tasdiqlashni so'raydi."""
     pending = context.user_data.get("broadcast_post")
     audience = context.user_data.get("broadcast_audience", "all")
-    user_ids = get_user_chat_ids_by_audience(audience)
+    user_ids = get_broadcast_recipients(audience)
     label = AUDIENCE_LABELS.get(audience, "foydalanuvchilar")
     chat_id = update.effective_chat.id
 
@@ -2119,7 +2318,7 @@ async def broadcast_confirm_callback(update: Update, context: ContextTypes.DEFAU
         await query.edit_message_text("⚠️ Sessiya topilmadi. /admin orqali qaytadan boshlang.")
         return ConversationHandler.END
 
-    user_ids = get_user_chat_ids_by_audience(audience)
+    user_ids = get_broadcast_recipients(audience)
     if not user_ids:
         label = AUDIENCE_LABELS.get(audience, "foydalanuvchilar")
         await query.edit_message_text(f"⚠️ Hozircha {label} yo'q.")
@@ -2184,7 +2383,247 @@ async def broadcast_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# ============ VIP STATUS BOSHQARUVI (/admin -> ⭐ VIP status berish) ============
+# ============ REKLAMA YUBORILMAYDIGANLAR RO'YXATI (/admin -> Reklama -> 🚫) ============
+
+async def render_adsexcl_list(query):
+    """Reklama yuborilmaydiganlar ro'yxatini (➕ Yangi qo'shish tugmasi bilan birga) chizadi."""
+    excluded = get_excluded_ads_users()
+    keyboard = [[InlineKeyboardButton("➕ Yangi qo'shish", callback_data="adm:adsexclnew")]]
+    for chat_id, username in excluded:
+        label = f"@{username}" if username else str(chat_id)
+        keyboard.append([InlineKeyboardButton(f"🚫 {label}", callback_data=f"adm:adsexcluser:{chat_id}")])
+    keyboard.append([InlineKeyboardButton("🔙 Orqaga", callback_data="adm:broadcast")])
+
+    text = (
+        "🚫 Reklama yuborilmaydiganlar ro'yxati:"
+        if excluded
+        else "🚫 Hozircha reklama yuborilmaydiganlar ro'yxati bo'sh."
+    )
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def adm_adsexcl_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """"🚫 Reklama yuborilmaydiganlar" tugmasi bosilganda ishga tushadi."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    await render_adsexcl_list(query)
+    return ConversationHandler.END
+
+
+async def adm_adsexcl_user_detail_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ro'yxatdagi bitta foydalanuvchi tugmasi bosilganda - tafsilot va o'chirish tugmasini ko'rsatadi."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update.effective_user.id):
+        return
+
+    target_chat_id = int(query.data.split(":")[2])
+    username = get_username(target_chat_id)
+    label = f"@{username}" if username else str(target_chat_id)
+
+    keyboard = [
+        [InlineKeyboardButton("🗑 Ro'yxatdan olib tashlash", callback_data=f"adm:adsexclremove:{target_chat_id}")],
+        [InlineKeyboardButton("🔙 Orqaga", callback_data="adm:adsexcl")],
+    ]
+    await query.edit_message_text(
+        f"🚫 {label}\nID: {target_chat_id}\n\n"
+        "Bu foydalanuvchiga hech qanday reklama (auditoriyasidan qat'i nazar) yuborilmaydi.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def adm_adsexcl_remove_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """"🗑 Ro'yxatdan olib tashlash" tugmasi bosilganda ishga tushadi."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update.effective_user.id):
+        return
+
+    target_chat_id = int(query.data.split(":")[2])
+    set_ads_excluded(target_chat_id, False)
+    await render_adsexcl_list(query)
+
+
+async def adsexcl_new_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """"➕ Yangi qo'shish" tugmasi bosilganda ishga tushadi."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+
+    await query.edit_message_text(
+        "👤 Reklama yuborilmaydigan foydalanuvchining ID raqamini yoki @username'ini yozing.\n\n"
+        "Eslatma: foydalanuvchi botga kamida bir marta murojaat qilgan bo'lishi kerak.\n\n"
+        "Bekor qilish uchun /cancel yozing."
+    )
+    return WAITING_ADSEXCL_USER
+
+
+async def adsexcl_new_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    identifier = (update.message.text or "").strip()
+    chat_id = find_user_chat_id(identifier)
+
+    if chat_id is None:
+        await update.message.reply_text(
+            "❌ Bunday foydalanuvchi topilmadi (u botga hali murojaat qilmagan bo'lishi mumkin).\n"
+            "Qaytadan urinib ko'ring, yoki /cancel bilan bekor qiling."
+        )
+        return WAITING_ADSEXCL_USER
+
+    set_ads_excluded(chat_id, True)
+    username = get_username(chat_id)
+    label = f"@{username}" if username else str(chat_id)
+
+    excluded = get_excluded_ads_users()
+    keyboard = [[InlineKeyboardButton("➕ Yangi qo'shish", callback_data="adm:adsexclnew")]]
+    for cid, uname in excluded:
+        lbl = f"@{uname}" if uname else str(cid)
+        keyboard.append([InlineKeyboardButton(f"🚫 {lbl}", callback_data=f"adm:adsexcluser:{cid}")])
+    keyboard.append([InlineKeyboardButton("🔙 Orqaga", callback_data="adm:broadcast")])
+
+    await update.message.reply_text(
+        f"✅ {label} reklama yuborilmaydiganlar ro'yxatiga qo'shildi.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    return ConversationHandler.END
+
+
+async def adsexcl_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Bekor qilindi.")
+    return ConversationHandler.END
+
+
+# ============ "DOIM YUBORILADI" RO'YXATI (/admin -> Reklama -> ✅) ============
+# "Reklama yuborilmaydiganlar"ning aksi - bu yerga qo'shilgan foydalanuvchi
+# YOKI KANAL, auditoriya (oddiy/VIP/hammaga) va "yuborilmaydiganlar"
+# ro'yxatidan qat'i nazar, HAR DOIM reklamani oladi. Kanal qo'shish uchun
+# bot o'sha kanalda ADMIN bo'lishi shart.
+
+def _adsalways_icon(kind: str) -> str:
+    return "📺" if kind == "channel" else "✅"
+
+
+async def render_adsalways_list(query):
+    """'Doim yuboriladi' ro'yxatini (➕ Yangi qo'shish tugmasi bilan birga) chizadi."""
+    items = get_always_send_list()
+    keyboard = [[InlineKeyboardButton("➕ Yangi qo'shish", callback_data="adm:adsalwaysnew")]]
+    for chat_id, label, kind in items:
+        icon = _adsalways_icon(kind)
+        keyboard.append([InlineKeyboardButton(f"{icon} {label}", callback_data=f"adm:adsalwaysitem:{chat_id}")])
+    keyboard.append([InlineKeyboardButton("🔙 Orqaga", callback_data="adm:broadcast")])
+
+    text = (
+        "✅ 'Doim yuboriladi' ro'yxati:\n\n"
+        "Bu yerdagi foydalanuvchi/kanallarga auditoriya tanlovi va "
+        "'yuborilmaydiganlar' ro'yxatidan qat'i nazar HAR DOIM reklama yuboriladi."
+        if items
+        else "✅ Hozircha 'Doim yuboriladi' ro'yxati bo'sh.\n\n"
+        "Bu yerga qo'shilgan foydalanuvchi/kanallarga har doim reklama yuboriladi."
+    )
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def adm_adsalways_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """"✅ Doim yuboriladi" tugmasi bosilganda ishga tushadi."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    await render_adsalways_list(query)
+    return ConversationHandler.END
+
+
+async def adm_adsalways_item_detail_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ro'yxatdagi bitta yozuv tugmasi bosilganda - tafsilot va o'chirish tugmasini ko'rsatadi."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update.effective_user.id):
+        return
+
+    target_chat_id = int(query.data.split(":")[2])
+
+    items = dict((cid, (label, kind)) for cid, label, kind in get_always_send_list())
+    label, kind = items.get(target_chat_id, (str(target_chat_id), "user"))
+    icon = _adsalways_icon(kind)
+    kind_label = "Kanal/guruh" if kind == "channel" else "Foydalanuvchi"
+
+    keyboard = [
+        [InlineKeyboardButton("🗑 Ro'yxatdan olib tashlash", callback_data=f"adm:adsalwaysremove:{target_chat_id}")],
+        [InlineKeyboardButton("🔙 Orqaga", callback_data="adm:adsalways")],
+    ]
+    await query.edit_message_text(
+        f"{icon} {label}\nTuri: {kind_label}\nID: {target_chat_id}\n\n"
+        "Bu chatga HAR DOIM reklama yuboriladi (auditoriya tanlovi va "
+        "'yuborilmaydiganlar' ro'yxatidan qat'i nazar).",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def adm_adsalways_remove_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """"🗑 Ro'yxatdan olib tashlash" tugmasi bosilganda ishga tushadi."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update.effective_user.id):
+        return
+
+    target_chat_id = int(query.data.split(":")[2])
+    remove_always_send(target_chat_id)
+    await render_adsalways_list(query)
+
+
+async def adsalways_new_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """"➕ Yangi qo'shish" tugmasi bosilganda ishga tushadi."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+
+    await query.edit_message_text(
+        "✅ 'Doim yuboriladi' ro'yxatiga qo'shish\n\n"
+        "Quyidagilardan BIRINI yuboring:\n"
+        "• Foydalanuvchining ID raqami yoki @username'i\n"
+        "  (botga kamida bir marta murojaat qilgan bo'lishi kerak)\n"
+        "• Kanal/guruh havolasi yoki @username'i (bot u yerda ADMIN bo'lishi shart)\n"
+        "• YOKI kanaldan/guruhdan istalgan xabarni shu yerga FORWARD qiling\n\n"
+        "Bekor qilish uchun /cancel yozing."
+    )
+    return WAITING_ADSALWAYS_ITEM
+
+
+async def adsalways_new_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id, label, kind = await resolve_broadcast_target(context, update.message)
+
+    if chat_id is None:
+        # 'label' bu holatda xato matni
+        await update.message.reply_text(
+            f"{label}\n\nQaytadan urinib ko'ring, yoki /cancel bilan bekor qiling."
+        )
+        return WAITING_ADSALWAYS_ITEM
+
+    add_always_send(chat_id, label, kind)
+    icon = _adsalways_icon(kind)
+
+    items = get_always_send_list()
+    keyboard = [[InlineKeyboardButton("➕ Yangi qo'shish", callback_data="adm:adsalwaysnew")]]
+    for cid, lbl, knd in items:
+        keyboard.append(
+            [InlineKeyboardButton(f"{_adsalways_icon(knd)} {lbl}", callback_data=f"adm:adsalwaysitem:{cid}")]
+        )
+    keyboard.append([InlineKeyboardButton("🔙 Orqaga", callback_data="adm:broadcast")])
+
+    await update.message.reply_text(
+        f"✅ {icon} {label} 'Doim yuboriladi' ro'yxatiga qo'shildi.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    return ConversationHandler.END
+
+
+async def adsalways_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Bekor qilindi.")
+    return ConversationHandler.END
+
 
 async def render_vip_menu(query):
     """VIP foydalanuvchilar ro'yxatini (tepada 'Yangi VIP' tugmasi bilan) chizadi."""
@@ -3242,10 +3681,14 @@ def main():
     broadcast_conversation = ConversationHandler(
         entry_points=[
             CallbackQueryHandler(broadcast_start, pattern=r"^adm:broadcast$"),
+            CallbackQueryHandler(adsexcl_new_start, pattern=r"^adm:adsexclnew$"),
+            CallbackQueryHandler(adsalways_new_start, pattern=r"^adm:adsalwaysnew$"),
         ],
         states={
             WAITING_BROADCAST_AUDIENCE: [
                 CallbackQueryHandler(broadcast_choose_audience, pattern=r"^adm:bcast:(regular|vip|all)$"),
+                CallbackQueryHandler(adm_adsexcl_list_callback, pattern=r"^adm:adsexcl$"),
+                CallbackQueryHandler(adm_adsalways_list_callback, pattern=r"^adm:adsalways$"),
             ],
             WAITING_BROADCAST_POST: [
                 MessageHandler(filters.ALL & ~filters.COMMAND, broadcast_receive_post),
@@ -3259,6 +3702,12 @@ def main():
             WAITING_BROADCAST_CONFIRM: [
                 CallbackQueryHandler(broadcast_confirm_callback, pattern=r"^adm:bcastconfirm$"),
                 CallbackQueryHandler(broadcast_confirm_cancel_callback, pattern=r"^adm:bcastcancel$"),
+            ],
+            WAITING_ADSEXCL_USER: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, adsexcl_new_receive),
+            ],
+            WAITING_ADSALWAYS_ITEM: [
+                MessageHandler(filters.ALL & ~filters.COMMAND, adsalways_new_receive),
             ],
         },
         fallbacks=[CommandHandler("cancel", broadcast_cancel)],
@@ -3350,6 +3799,12 @@ def main():
     app.add_handler(CallbackQueryHandler(adm_vipcancel_confirm_callback, pattern=r"^adm:vipcanceling:\d+$"))
     app.add_handler(CallbackQueryHandler(adm_vipcancel_do_callback, pattern=r"^adm:vipcanceldo:\d+$"))
     app.add_handler(CallbackQueryHandler(adm_users_page_callback, pattern=r"^adm:userspage:\d+$"))
+    app.add_handler(CallbackQueryHandler(adm_adsexcl_list_callback, pattern=r"^adm:adsexcl$"))
+    app.add_handler(CallbackQueryHandler(adm_adsexcl_user_detail_callback, pattern=r"^adm:adsexcluser:\d+$"))
+    app.add_handler(CallbackQueryHandler(adm_adsexcl_remove_callback, pattern=r"^adm:adsexclremove:\d+$"))
+    app.add_handler(CallbackQueryHandler(adm_adsalways_list_callback, pattern=r"^adm:adsalways$"))
+    app.add_handler(CallbackQueryHandler(adm_adsalways_item_detail_callback, pattern=r"^adm:adsalwaysitem:-?\d+$"))
+    app.add_handler(CallbackQueryHandler(adm_adsalways_remove_callback, pattern=r"^adm:adsalwaysremove:-?\d+$"))
     app.add_handler(CallbackQueryHandler(adm_editlist_callback, pattern=r"^adm:editlist$"))
     app.add_handler(CallbackQueryHandler(adm_postdetail_callback, pattern=r"^adm:editpost:\d+$"))
     app.add_handler(CallbackQueryHandler(adm_editvis_menu, pattern=r"^adm:editvis:\d+$"))
