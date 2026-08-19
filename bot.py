@@ -83,8 +83,8 @@ from telegram.ext import (
 # BOT_TOKEN va DB_PATH avval Railway/server "Variables" bo'limidan o'qiladi
 # (agar bo'lmasa, pastdagi standart qiymat ishlatiladi - masalan kompyuterda
 # sinab ko'rish uchun).
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "BOT_TOKEN_BU_YERGA")
-ADMIN_IDS = [123456789]                    # Sizning Telegram user ID(lar)ingiz
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "6789063207:AAEhyLrYQiqChF_2xKOrleyp6im8On1ZMm4")
+ADMIN_IDS = [5393636771]                    # Sizning Telegram user ID(lar)ingiz
 DB_PATH = os.environ.get("DB_PATH", "movies.db")
 
 # SAQLASH GURUHI (ixtiyoriy, lekin QATTIQ TAVSIYA ETILADI):
