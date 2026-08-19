@@ -83,8 +83,8 @@ from telegram.ext import (
 # BOT_TOKEN va DB_PATH avval Railway/server "Variables" bo'limidan o'qiladi
 # (agar bo'lmasa, pastdagi standart qiymat ishlatiladi - masalan kompyuterda
 # sinab ko'rish uchun).
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "6789063207:AAEhyLrYQiqChF_2xKOrleyp6im8On1ZMm4")
-ADMIN_IDS = [5393636771]                    # Sizning Telegram user ID(lar)ingiz
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "BOT_TOKEN_BU_YERGA")
+ADMIN_IDS = [123456789]                    # Sizning Telegram user ID(lar)ingiz
 DB_PATH = os.environ.get("DB_PATH", "movies.db")
 
 # SAQLASH GURUHI (ixtiyoriy, lekin QATTIQ TAVSIYA ETILADI):
@@ -2994,7 +2994,16 @@ async def db_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await message.reply_text(
         f"✅ Baza guruhi sozlandi!\nGuruh: {chat.title or chat.id}\nID: {chat.id}\n\n"
         "Bundan buyon /add yoki /add_game orqali qo'shiladigan barcha postlar "
-        "shu guruhda xavfsiz saqlanadi."
+        "shu guruhda xavfsiz saqlanadi.\n\n"
+        "⚠️ MUHIM (ishonchlilik uchun QATTIQ TAVSIYA ETILADI): Render (yoki "
+        "boshqa serveringiz) sozlamalarida \"Environment\" bo'limiga quyidagini "
+        "QO'LDA qo'shing:\n\n"
+        f"STORAGE_CHAT_ID = {chat.id}\n\n"
+        "Sababi: bu ID hozircha faqat botning ma'lumotlar bazasida saqlangan. "
+        "Agar baza fayli biror sababdan yo'qolib qolsa (masalan qayta deploy "
+        "paytida), muhit o'zgaruvchisi bo'lmasa, bot 'qayerdan tiklashim kerak' "
+        "degan savolga javob topa olmay qoladi. Muhit o'zgaruvchisi esa fayl "
+        "tizimidan mustaqil - u har doim saqlanib qoladi."
     )
     return ConversationHandler.END
 
@@ -3528,10 +3537,35 @@ def start_health_check_server():
 
 
 def _get_backup_chat_id():
-    """Zaxira nusxa qayerga yuborilishi kerakligini aniqlaydi: avval 'baza
-    guruhi' (agar sozlangan bo'lsa), aks holda birinchi admin bilan shaxsiy
-    chat."""
-    return get_storage_chat_id() or (ADMIN_IDS[0] if ADMIN_IDS else None)
+    """
+    Zaxira nusxa qayerga yuborilishi/qidirilishi kerakligini aniqlaydi.
+
+    MUHIM: bu yerda ATAYLAB avval STORAGE_CHAT_ID (kod/muhit o'zgaruvchisi)
+    tekshiriladi, va FAQAT SHUNDAN KEYIN bazadagi (admin panel orqali
+    sozlangan) qiymatga qaraladi - aksi bo'lgan tartib emas!
+
+    Sababi: agar mahalliy movies.db fayli yo'qolib qolsa (masalan Render
+    qayta deploy qilinganda), bazada saqlangan sozlama ham u bilan birga
+    yo'qoladi - va bot "qayerdan tiklashim kerak" degan savolga javobni
+    aynan o'sha yo'qolgan fayldan qidirishga majbur bo'ladi (tuxum-tovuq
+    muammosi). Muhit o'zgaruvchisi esa fayl tizimidan mustaqil - u har
+    doim saqlanib qoladi, shuning uchun tiklash tizimi UCHUN eng ishonchli
+    manba aynan shu.
+    """
+    return STORAGE_CHAT_ID or get_storage_chat_id() or (ADMIN_IDS[0] if ADMIN_IDS else None)
+
+
+def _count_posts_in_db() -> int:
+    """Mahalliy bazadagi postlar sonini hisoblaydi (xavfsizlik tekshiruvi uchun)."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM posts")
+        count = cur.fetchone()[0]
+        conn.close()
+        return count
+    except Exception:
+        return 0
 
 
 async def backup_database(context: ContextTypes.DEFAULT_TYPE):
@@ -3546,6 +3580,13 @@ async def backup_database(context: ContextTypes.DEFAULT_TYPE):
     muvaffaqiyatli yuklab bo'lingandan KEYIN, undan OLDINGI (eski) zaxira
     xabari avtomatik o'chiriladi - shunda guruhda doim faqat BITTA (eng
     so'nggi) zaxira fayli saqlanadi.
+
+    ⚠️ XAVFSIZLIK TEKSHIRUVI: agar mahalliy baza BO'SH (0 ta post) bo'lsa-yu,
+    guruhda ALLAQACHON zaxira mavjud bo'lsa - bu zaxiralanmaydi va OLDINGI
+    zaxira O'CHIRILMAYDI. Bu, masalan ikkita bot nusxasi tasodifan bir
+    vaqtda ishlab, yangi (hali tiklanmagan, bo'sh) nusxa o'zining bo'sh
+    holatini "yangi haqiqat" sifatida yozib, yaxshi zaxirani yo'q qilib
+    yuborishining oldini oladi.
     """
     backup_chat_id = _get_backup_chat_id()
     if not backup_chat_id:
@@ -3555,8 +3596,47 @@ async def backup_database(context: ContextTypes.DEFAULT_TYPE):
         return
 
     previous_backup_message_id = get_setting("last_backup_message_id")
+    posts_count = _count_posts_in_db()
+
+    if posts_count == 0 and previous_backup_message_id:
+        logger.warning(
+            "⚠️ Mahalliy baza BO'SH (0 ta post), lekin oldin zaxira mavjud - "
+            "xavfsizlik uchun zaxiralash O'TKAZIB YUBORILDI (yaxshi zaxira saqlanib qoladi)."
+        )
+        return
 
     try:
+        with open(DB_PATH, "rb") as f:
+            sent = await context.bot.send_document(
+                chat_id=backup_chat_id,
+                document=f,
+                filename="movies_backup.db",
+                caption="🗄 Avtomatik zaxira nusxa (backup) - bu xabarni O'CHIRMANG.",
+            )
+        try:
+            await context.bot.pin_chat_message(
+                chat_id=backup_chat_id, message_id=sent.message_id, disable_notification=True
+            )
+        except Exception:
+            logger.warning(
+                "Zaxira xabarini PIN qilib bo'lmadi - botda 'Pin messages' huquqi "
+                "borligini tekshiring (aks holda tiklash ishlamaydi)."
+            )
+
+        # Yangi zaxira muvaffaqiyatli yuklandi - endi shu haqidagi ma'lumotni
+        # saqlaymiz va, agar oldingi zaxira bo'lsa, uni guruhdan o'chiramiz.
+        set_setting("last_backup_message_id", str(sent.message_id))
+
+        if previous_backup_message_id:
+            try:
+                await context.bot.delete_message(
+                    chat_id=backup_chat_id, message_id=int(previous_backup_message_id)
+                )
+            except Exception:
+                # Allaqachon o'chirilgan yoki topilmagan bo'lishi mumkin - muammo emas.
+                pass
+    except Exception:
+        logger.exception("Bazani zaxiralashda xatolik yuz berdi.")
         with open(DB_PATH, "rb") as f:
             sent = await context.bot.send_document(
                 chat_id=backup_chat_id,
