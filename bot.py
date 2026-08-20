@@ -1740,6 +1740,7 @@ def admin_menu_markup():
         [InlineKeyboardButton("📺 VIP kanal", callback_data="adm:setvipchannel")],
         [InlineKeyboardButton("🎁 VIP boshlanish posti (VIP1)", callback_data="adm:setvip1")],
         [InlineKeyboardButton("⏰ VIP tugash posti (VIP2)", callback_data="adm:setvip2")],
+        [InlineKeyboardButton("🔄 Hozir zaxiralash / tekshirish", callback_data="adm:backupnow")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -2979,8 +2980,14 @@ async def db_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         member = await context.bot.get_chat_member(chat.id, context.bot.id)
         is_group_admin = member.status in ("administrator", "creator")
+        # "Pin messages" huquqi alohida tekshiriladi - bazani zaxiralash/tiklash
+        # tizimi FAQAT shu huquq orqali ishlaydi (Bot API'da guruh tarixini
+        # "qidirish" imkoni umuman yo'q - faqat PIN qilingan xabarni topish
+        # mumkin, shuning uchun bu huquq juda muhim).
+        can_pin = getattr(member, "can_pin_messages", False) or member.status == "creator"
     except Exception:
         is_group_admin = False
+        can_pin = False
 
     if not is_group_admin:
         await message.reply_text(
@@ -2990,11 +2997,26 @@ async def db_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return WAITING_DB_GROUP
 
+    pin_warning = ""
+    if not can_pin:
+        pin_warning = (
+            "\n\n🔴 DIQQAT - JIDDIY MUAMMO: botda \"Pin messages\" (xabarlarni "
+            "qadash) huquqi YO'Q!\n"
+            "Ma'lumotlar bazasini zaxiralash/tiklash tizimi FAQAT shu huquq "
+            "orqali ishlaydi - Telegram Bot API botlarga guruh tarixini "
+            "\"qidirish\" imkonini bermaydi, faqat PIN qilingan xabarni topish "
+            "mumkin. Shu huquqsiz, zaxira yuklanadi, lekin bot uni HECH QACHON "
+            "qayta topa olmaydi va baza yo'qolganda tiklay olmaydi!\n\n"
+            "Iltimos, guruh sozlamalaridan (Administrators → bot) "
+            "\"Pin Messages\" huquqini albatta yoqing."
+        )
+
     set_setting("storage_chat_id", str(chat.id))
     await message.reply_text(
         f"✅ Baza guruhi sozlandi!\nGuruh: {chat.title or chat.id}\nID: {chat.id}\n\n"
         "Bundan buyon /add yoki /add_game orqali qo'shiladigan barcha postlar "
-        "shu guruhda xavfsiz saqlanadi.\n\n"
+        "shu guruhda xavfsiz saqlanadi."
+        f"{pin_warning}\n\n"
         "⚠️ MUHIM (ishonchlilik uchun QATTIQ TAVSIYA ETILADI): Render (yoki "
         "boshqa serveringiz) sozlamalarida \"Environment\" bo'limiga quyidagini "
         "QO'LDA qo'shing:\n\n"
@@ -3568,7 +3590,7 @@ def _count_posts_in_db() -> int:
         return 0
 
 
-async def backup_database(context: ContextTypes.DEFAULT_TYPE):
+async def backup_database(context: ContextTypes.DEFAULT_TYPE) -> dict:
     """
     movies.db faylini (SQLite bazaning o'zini) hujjat sifatida saqlash
     guruhiga (yoki admin chatiga) yuklaydi va PIN qiladi. Bu Render kabi
@@ -3583,17 +3605,19 @@ async def backup_database(context: ContextTypes.DEFAULT_TYPE):
 
     ⚠️ XAVFSIZLIK TEKSHIRUVI: agar mahalliy baza BO'SH (0 ta post) bo'lsa-yu,
     guruhda ALLAQACHON zaxira mavjud bo'lsa - bu zaxiralanmaydi va OLDINGI
-    zaxira O'CHIRILMAYDI. Bu, masalan ikkita bot nusxasi tasodifan bir
-    vaqtda ishlab, yangi (hali tiklanmagan, bo'sh) nusxa o'zining bo'sh
-    holatini "yangi haqiqat" sifatida yozib, yaxshi zaxirani yo'q qilib
-    yuborishining oldini oladi.
+    zaxira O'CHIRILMAYDI.
+
+    Diagnostika uchun natija lug'atini qaytaradi: {"ok", "reason", "pinned",
+    "posts_count", "chat_id"} - bu /admin dagi "Hozir zaxiralash" tugmasi
+    orqali adminga to'liq holatni ko'rsatish uchun ishlatiladi.
     """
     backup_chat_id = _get_backup_chat_id()
     if not backup_chat_id:
         logger.warning("Bazani zaxiralash uchun chat topilmadi (baza guruhi ham, admin ham sozlanmagan).")
-        return
+        return {"ok": False, "reason": "no_chat", "pinned": False, "posts_count": 0, "chat_id": None}
+
     if not os.path.exists(DB_PATH):
-        return
+        return {"ok": False, "reason": "no_file", "pinned": False, "posts_count": 0, "chat_id": backup_chat_id}
 
     previous_backup_message_id = get_setting("last_backup_message_id")
     posts_count = _count_posts_in_db()
@@ -3603,7 +3627,10 @@ async def backup_database(context: ContextTypes.DEFAULT_TYPE):
             "⚠️ Mahalliy baza BO'SH (0 ta post), lekin oldin zaxira mavjud - "
             "xavfsizlik uchun zaxiralash O'TKAZIB YUBORILDI (yaxshi zaxira saqlanib qoladi)."
         )
-        return
+        return {
+            "ok": False, "reason": "empty_skip", "pinned": False,
+            "posts_count": posts_count, "chat_id": backup_chat_id,
+        }
 
     try:
         with open(DB_PATH, "rb") as f:
@@ -3613,61 +3640,111 @@ async def backup_database(context: ContextTypes.DEFAULT_TYPE):
                 filename="movies_backup.db",
                 caption="🗄 Avtomatik zaxira nusxa (backup) - bu xabarni O'CHIRMANG.",
             )
+    except Exception:
+        logger.exception("Bazani zaxiralashda (yuklashda) xatolik yuz berdi.")
+        return {
+            "ok": False, "reason": "upload_failed", "pinned": False,
+            "posts_count": posts_count, "chat_id": backup_chat_id,
+        }
+
+    pinned_ok = False
+    try:
+        await context.bot.pin_chat_message(
+            chat_id=backup_chat_id, message_id=sent.message_id, disable_notification=True
+        )
+        pinned_ok = True
+    except Exception:
+        logger.warning(
+            "Zaxira xabarini PIN qilib bo'lmadi - botda 'Pin messages' huquqi "
+            "borligini tekshiring (aks holda tiklash ishlamaydi)."
+        )
+
+    # Yangi zaxira muvaffaqiyatli yuklandi - endi shu haqidagi ma'lumotni
+    # saqlaymiz va, agar oldingi zaxira bo'lsa, uni guruhdan o'chiramiz.
+    set_setting("last_backup_message_id", str(sent.message_id))
+
+    if previous_backup_message_id:
         try:
-            await context.bot.pin_chat_message(
-                chat_id=backup_chat_id, message_id=sent.message_id, disable_notification=True
+            await context.bot.delete_message(
+                chat_id=backup_chat_id, message_id=int(previous_backup_message_id)
             )
         except Exception:
-            logger.warning(
-                "Zaxira xabarini PIN qilib bo'lmadi - botda 'Pin messages' huquqi "
-                "borligini tekshiring (aks holda tiklash ishlamaydi)."
-            )
+            # Allaqachon o'chirilgan yoki topilmagan bo'lishi mumkin - muammo emas.
+            pass
 
-        # Yangi zaxira muvaffaqiyatli yuklandi - endi shu haqidagi ma'lumotni
-        # saqlaymiz va, agar oldingi zaxira bo'lsa, uni guruhdan o'chiramiz.
-        set_setting("last_backup_message_id", str(sent.message_id))
+    return {
+        "ok": True, "reason": "success", "pinned": pinned_ok,
+        "posts_count": posts_count, "chat_id": backup_chat_id,
+    }
 
-        if previous_backup_message_id:
+
+async def backup_database_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    `job_queue.run_repeating` orqali har 10 daqiqada chaqiriladigan wrapper.
+    `backup_database`ni chaqiradi, va agar zaxira YUKLANGAN, lekin PIN
+    qilinmagan bo'lsa (ya'ni tiklash ISHLAMAYDIGAN holatda qolsa) - adminga
+    darhol ogohlantirish xabari yuboradi. Spam bo'lmasligi uchun, xabar
+    faqat HOLAT O'ZGARGANDA (avval yaxshi edi, endi yomon bo'lib qoldi)
+    yuboriladi, har safar emas.
+    """
+    result = await backup_database(context)
+
+    pin_problem_now = result.get("ok") and not result.get("pinned")
+    was_already_warned = get_setting("pin_problem_warned") == "1"
+
+    if pin_problem_now and not was_already_warned:
+        set_setting("pin_problem_warned", "1")
+        for admin_id in ADMIN_IDS:
             try:
-                await context.bot.delete_message(
-                    chat_id=backup_chat_id, message_id=int(previous_backup_message_id)
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=(
+                        "🚨 DIQQAT: Baza zaxirasi yuklandi, LEKIN PIN QILINMADI!\n\n"
+                        "Bu degani - agar bot qayta ishga tushsa (masalan qayta "
+                        "deploy qilinganda), u bu zaxirani TOPA OLMAYDI va "
+                        "BO'SH bazadan boshlaydi - barcha postlar yo'qoladi!\n\n"
+                        "Iltimos, tezda tuzating: guruh sozlamalari → "
+                        "Administrators → botingiz → 'Pin Messages' huquqini yoqing."
+                    ),
                 )
             except Exception:
-                # Allaqachon o'chirilgan yoki topilmagan bo'lishi mumkin - muammo emas.
-                pass
-    except Exception:
-        logger.exception("Bazani zaxiralashda xatolik yuz berdi.")
-        with open(DB_PATH, "rb") as f:
-            sent = await context.bot.send_document(
-                chat_id=backup_chat_id,
-                document=f,
-                filename="movies_backup.db",
-                caption="🗄 Avtomatik zaxira nusxa (backup) - bu xabarni O'CHIRMANG.",
-            )
-        try:
-            await context.bot.pin_chat_message(
-                chat_id=backup_chat_id, message_id=sent.message_id, disable_notification=True
-            )
-        except Exception:
-            logger.warning(
-                "Zaxira xabarini PIN qilib bo'lmadi - botda 'Pin messages' huquqi "
-                "borligini tekshiring (aks holda tiklash ishlamaydi)."
-            )
+                logger.exception("Pin muammosi haqida adminga (%s) xabar yuborib bo'lmadi.", admin_id)
+    elif not pin_problem_now and was_already_warned and result.get("ok"):
+        # Muammo tuzatilgan - keyingi safar yana muammo chiqsa, qayta ogohlantirish kerak
+        set_setting("pin_problem_warned", "0")
 
-        # Yangi zaxira muvaffaqiyatli yuklandi - endi shu haqidagi ma'lumotni
-        # saqlaymiz va, agar oldingi zaxira bo'lsa, uni guruhdan o'chiramiz.
-        set_setting("last_backup_message_id", str(sent.message_id))
 
-        if previous_backup_message_id:
-            try:
-                await context.bot.delete_message(
-                    chat_id=backup_chat_id, message_id=int(previous_backup_message_id)
-                )
-            except Exception:
-                # Allaqachon o'chirilgan yoki topilmagan bo'lishi mumkin - muammo emas.
-                pass
-    except Exception:
-        logger.exception("Bazani zaxiralashda xatolik yuz berdi.")
+_BACKUP_REASON_LABELS = {
+    "success": "Muvaffaqiyatli yuklandi",
+    "no_chat": "Saqlash chati topilmadi (baza guruhi sozlanmagan)",
+    "no_file": "Mahalliy baza fayli topilmadi",
+    "empty_skip": "Baza bo'sh - xavfsizlik uchun o'tkazib yuborildi (eski zaxira saqlanib qoldi)",
+    "upload_failed": "Yuklashda xatolik yuz berdi",
+}
+
+
+async def adm_backupnow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin "🔄 Hozir zaxiralash / tekshirish" tugmasini bosganda - darhol
+    zaxiralaydi va to'liq diagnostika natijasini ko'rsatadi."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update.effective_user.id):
+        return
+
+    await query.edit_message_text("🔄 Zaxiralanmoqda, biroz kuting...")
+    result = await backup_database(context)
+
+    lines = ["🔄 Zaxiralash natijasi:\n"]
+    lines.append(f"Holat: {'✅ Muvaffaqiyatli' if result['ok'] else '❌ Muvaffaqiyatsiz'}")
+    lines.append(f"Sabab: {_BACKUP_REASON_LABELS.get(result['reason'], result['reason'])}")
+    lines.append(f"Postlar soni (mahalliy bazada): {result['posts_count']}")
+    lines.append(f"Saqlash chati ID: {result['chat_id']}")
+    if result["ok"]:
+        pin_text = "✅ Ha" if result["pinned"] else "❌ Yo'q (MUAMMO - tiklash ishlamaydi!)"
+        lines.append(f"PIN qilindi: {pin_text}")
+
+    keyboard = [[InlineKeyboardButton("🔙 Orqaga", callback_data="adm:menu")]]
+    await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def restore_database_if_needed(bot):
@@ -3871,6 +3948,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_list_page_callback, pattern=r"^listpage:"))
     app.add_handler(CallbackQueryHandler(handle_list_close_callback, pattern=r"^listclose$"))
     app.add_handler(CallbackQueryHandler(adm_menu_callback, pattern=r"^adm:menu$"))
+    app.add_handler(CallbackQueryHandler(adm_backupnow_callback, pattern=r"^adm:backupnow$"))
     app.add_handler(CallbackQueryHandler(adm_backhome_callback, pattern=r"^adm:backhome$"))
     app.add_handler(CallbackQueryHandler(adm_stats_callback, pattern=r"^adm:stats$"))
     app.add_handler(CallbackQueryHandler(adm_users_callback, pattern=r"^adm:users$"))
@@ -3907,7 +3985,7 @@ def main():
         # Bazani har 10 daqiqada avtomatik zaxiralab turadi (Render kabi
         # platformalarda doimiy fayl xotirasi bo'lmagani uchun ZARUR -
         # aks holda qayta deploy qilinganda barcha ma'lumot yo'qolib ketadi).
-        app.job_queue.run_repeating(backup_database, interval=600, first=60)
+        app.job_queue.run_repeating(backup_database_job, interval=600, first=60)
     else:
         logger.warning(
             "job_queue mavjud emas - VIP muddati tugaganda avtomatik kanaldan "
