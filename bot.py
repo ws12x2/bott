@@ -1725,6 +1725,8 @@ WAITING_VIP_ADJUST_DAYS = 302  # VIP muddatini uzaytirish/qisqartirish uchun alo
 WAITING_DB_GROUP = 400  # Baza guruhini sozlash suhbati uchun alohida holat
 WAITING_VIP_CHANNEL = 500  # VIP kanalni sozlash suhbati uchun alohida holat
 WAITING_VIP_SPECIAL_POST = 600  # VIP1/VIP2 postini sozlash suhbati uchun alohida holat
+WAITING_DB_UPLOAD = 700  # Bazani qo'lda .db fayl orqali yuklash holati
+WAITING_DB_UPLOAD_CONFIRM = 701  # Yuklangan bazani tasdiqlash holati
 
 
 def admin_menu_markup():
@@ -1741,6 +1743,8 @@ def admin_menu_markup():
         [InlineKeyboardButton("🎁 VIP boshlanish posti (VIP1)", callback_data="adm:setvip1")],
         [InlineKeyboardButton("⏰ VIP tugash posti (VIP2)", callback_data="adm:setvip2")],
         [InlineKeyboardButton("🔄 Hozir zaxiralash / tekshirish", callback_data="adm:backupnow")],
+        [InlineKeyboardButton("♻️ Zaxiradan hozir tiklash", callback_data="adm:restorenow")],
+        [InlineKeyboardButton("📥 DB faylni qo'lda yuklash", callback_data="adm:dbupload")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -3747,6 +3751,34 @@ async def adm_backupnow_callback(update: Update, context: ContextTypes.DEFAULT_T
     await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard))
 
 
+async def _restore_from_pinned_backup(bot) -> dict:
+    """
+    'Baza guruhi'da PIN qilingan eng so'nggi zaxira hujjatini qidirib,
+    topilsa DB_PATH'ga yuklab qo'yadi. Natija lug'atini qaytaradi -
+    bu ham avtomatik ishga tushish bosqichida (restore_database_if_needed),
+    ham admin "♻️ Zaxiradan hozir tiklash" tugmasi bosilganda ishlatiladi.
+    """
+    backup_chat_id = _get_backup_chat_id()
+    if not backup_chat_id:
+        return {"ok": False, "reason": "no_chat", "posts_count": 0}
+
+    try:
+        chat = await bot.get_chat(backup_chat_id)
+        pinned = chat.pinned_message
+        if pinned is None or pinned.document is None:
+            return {"ok": False, "reason": "no_pinned", "posts_count": 0}
+        file = await bot.get_file(pinned.document.file_id)
+        await file.download_to_drive(DB_PATH)
+    except Exception:
+        logger.exception("Bazani zaxiradan tiklashda xatolik.")
+        return {"ok": False, "reason": "download_failed", "posts_count": 0}
+
+    init_db()  # tiklangan fayl ustida jadvallarni yaratish/migratsiya qilish
+    posts_count = _count_posts_in_db()
+    logger.info("✅ Baza muvaffaqiyatli zaxiradan tiklandi (%s), postlar: %s.", DB_PATH, posts_count)
+    return {"ok": True, "reason": "success", "posts_count": posts_count}
+
+
 async def restore_database_if_needed(bot):
     """
     Bot ishga tushganda (post_init bosqichida) chaqiriladi. Agar mahalliy
@@ -3756,23 +3788,177 @@ async def restore_database_if_needed(bot):
     """
     if os.path.exists(DB_PATH) and os.path.getsize(DB_PATH) > 0:
         return  # mahalliy baza allaqachon bor - tiklashga hojat yo'q
+    await _restore_from_pinned_backup(bot)
 
-    backup_chat_id = _get_backup_chat_id()
-    if not backup_chat_id:
-        logger.info("Zaxira manbai sozlanmagan - yangi (bo'sh) baza bilan boshlanadi.")
+
+async def adm_restorenow_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin "♻️ Zaxiradan hozir tiklash" tugmasini bosganda - PIN qilingan
+    zaxiradan QO'LDA, darhol tiklashga urinadi (fayl bo'sh bo'lmasa ham)."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update.effective_user.id):
         return
 
+    await query.edit_message_text("♻️ Tiklanmoqda, biroz kuting...")
+    result = await _restore_from_pinned_backup(context.bot)
+
+    reason_labels = {
+        "success": "Muvaffaqiyatli tiklandi",
+        "no_chat": "Saqlash chati topilmadi (baza guruhi sozlanmagan)",
+        "no_pinned": "PIN qilingan zaxira topilmadi",
+        "download_failed": "Yuklab olishda xatolik yuz berdi",
+    }
+    text = (
+        "♻️ Tiklash natijasi:\n\n"
+        f"Holat: {'✅ Muvaffaqiyatli' if result['ok'] else '❌ Muvaffaqiyatsiz'}\n"
+        f"Sabab: {reason_labels.get(result['reason'], result['reason'])}\n"
+        f"Postlar soni (tiklangandan keyin): {result['posts_count']}"
+    )
+    keyboard = [[InlineKeyboardButton("🔙 Orqaga", callback_data="adm:menu")]]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def dbupload_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin "📥 DB faylni qo'lda yuklash" tugmasini bosganda ishga tushadi."""
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+
+    await query.edit_message_text(
+        "📥 Bazani qo'lda tiklash\n\n"
+        "Iltimos, `.db` formatidagi SQLite faylni (masalan avval saqlab qo'ygan "
+        "`movies.db` nusxasini, yoki guruhdagi zaxirani) shu yerga HUJJAT "
+        "(fayl) sifatida yuboring.\n\n"
+        "⚠️ DIQQAT: bu joriy bazani BUTUNLAY almashtiradi!\n\n"
+        "Bekor qilish uchun /cancel yozing."
+    )
+    return WAITING_DB_UPLOAD
+
+
+async def dbupload_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+
+    message = update.message
+    document = message.document
+
+    if document is None:
+        await message.reply_text(
+            "❌ Bu hujjat (fayl) emasga o'xshaydi. `.db` faylni HUJJAT sifatida yuboring, "
+            "yoki /cancel bilan bekor qiling."
+        )
+        return WAITING_DB_UPLOAD
+
+    tmp_path = DB_PATH + ".import_tmp"
     try:
-        chat = await bot.get_chat(backup_chat_id)
-        pinned = chat.pinned_message
-        if pinned is None or pinned.document is None:
-            logger.info("PIN qilingan zaxira topilmadi - yangi (bo'sh) baza bilan boshlanadi.")
-            return
-        file = await bot.get_file(pinned.document.file_id)
-        await file.download_to_drive(DB_PATH)
-        logger.info("✅ Baza muvaffaqiyatli zaxiradan tiklandi (%s).", DB_PATH)
+        file = await context.bot.get_file(document.file_id)
+        await file.download_to_drive(tmp_path)
     except Exception:
-        logger.exception("Bazani tiklashda xatolik - yangi (bo'sh) baza bilan boshlanadi.")
+        logger.exception("Import uchun faylni yuklab olishda xatolik.")
+        await message.reply_text(
+            "❌ Faylni yuklab olishda xatolik yuz berdi. Qaytadan urinib ko'ring, "
+            "yoki /cancel bilan bekor qiling."
+        )
+        return WAITING_DB_UPLOAD
+
+    # Validatsiya: bu haqiqatan ham SQLite baza va bizning jadvalimizga egami?
+    posts_count = 0
+    try:
+        test_conn = sqlite3.connect(tmp_path)
+        test_cur = test_conn.cursor()
+        test_cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = {row[0] for row in test_cur.fetchall()}
+        if "posts" in tables:
+            test_cur.execute("SELECT COUNT(*) FROM posts")
+            posts_count = test_cur.fetchone()[0]
+        test_conn.close()
+    except Exception:
+        tables = set()
+
+    if "posts" not in tables:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        await message.reply_text(
+            "❌ Bu fayl to'g'ri SQLite baza emas, yoki bizning bot bazamizga "
+            "o'xshamayapti ('posts' jadvali topilmadi).\n\n"
+            "Boshqa faylni sinab ko'ring, yoki /cancel bilan bekor qiling."
+        )
+        return WAITING_DB_UPLOAD
+
+    context.user_data["dbupload_tmp_path"] = tmp_path
+    context.user_data["dbupload_posts_count"] = posts_count
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✅ Ha, almashtirish", callback_data="adm:dbuploadconfirm")],
+            [InlineKeyboardButton("❌ Yo'q, bekor qilish", callback_data="adm:dbuploadcancel")],
+        ]
+    )
+    await message.reply_text(
+        f"📦 Faylda {posts_count} ta post topildi.\n\n"
+        "⚠️ Bu joriy bazani BUTUNLAY almashtiradi. Davom etasizmi?",
+        reply_markup=keyboard,
+    )
+    return WAITING_DB_UPLOAD_CONFIRM
+
+
+async def dbupload_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+
+    tmp_path = context.user_data.pop("dbupload_tmp_path", None)
+    posts_count = context.user_data.pop("dbupload_posts_count", 0)
+
+    if not tmp_path or not os.path.exists(tmp_path):
+        await query.edit_message_text("⚠️ Sessiya topilmadi yoki fayl yo'qolgan. /admin orqali qaytadan boshlang.")
+        return ConversationHandler.END
+
+    try:
+        os.replace(tmp_path, DB_PATH)
+    except Exception:
+        logger.exception("Faylni almashtirishda xatolik.")
+        await query.edit_message_text("❌ Faylni almashtirishda ichki xatolik yuz berdi.")
+        return ConversationHandler.END
+
+    init_db()  # yangi fayl ustida jadvallarni yaratish/migratsiya qilish
+
+    await query.edit_message_text(
+        f"✅ Baza muvaffaqiyatli almashtirildi!\nTopilgan postlar soni: {posts_count}\n\n"
+        "Tavsiya: endi shu yangi bazani darhol zaxiralab qo'ying - "
+        "/admin → 🔄 Hozir zaxiralash / tekshirish tugmasini bosing."
+    )
+    return ConversationHandler.END
+
+
+async def dbupload_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    tmp_path = context.user_data.pop("dbupload_tmp_path", None)
+    context.user_data.pop("dbupload_posts_count", None)
+    if tmp_path and os.path.exists(tmp_path):
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+    await query.edit_message_text("Bekor qilindi.")
+    return ConversationHandler.END
+
+
+async def dbupload_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tmp_path = context.user_data.pop("dbupload_tmp_path", None)
+    context.user_data.pop("dbupload_posts_count", None)
+    if tmp_path and os.path.exists(tmp_path):
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+    await update.message.reply_text("Bekor qilindi.")
+    return ConversationHandler.END
 
 
 async def _post_init(app):
@@ -3930,6 +4116,22 @@ def main():
         fallbacks=[CommandHandler("cancel", vipspecial_cancel)],
     )
 
+    dbupload_conversation = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(dbupload_start, pattern=r"^adm:dbupload$"),
+        ],
+        states={
+            WAITING_DB_UPLOAD: [
+                MessageHandler(filters.Document.ALL & ~filters.COMMAND, dbupload_receive),
+            ],
+            WAITING_DB_UPLOAD_CONFIRM: [
+                CallbackQueryHandler(dbupload_confirm_callback, pattern=r"^adm:dbuploadconfirm$"),
+                CallbackQueryHandler(dbupload_cancel_callback, pattern=r"^adm:dbuploadcancel$"),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", dbupload_cancel)],
+    )
+
     app.add_handler(add_conversation)
     app.add_handler(edit_conversation)
     app.add_handler(broadcast_conversation)
@@ -3937,6 +4139,7 @@ def main():
     app.add_handler(db_conversation)
     app.add_handler(vipchannel_conversation)
     app.add_handler(vipspecial_conversation)
+    app.add_handler(dbupload_conversation)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("list", list_movies))
     app.add_handler(CommandHandler("games", list_games))
@@ -3949,6 +4152,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_list_close_callback, pattern=r"^listclose$"))
     app.add_handler(CallbackQueryHandler(adm_menu_callback, pattern=r"^adm:menu$"))
     app.add_handler(CallbackQueryHandler(adm_backupnow_callback, pattern=r"^adm:backupnow$"))
+    app.add_handler(CallbackQueryHandler(adm_restorenow_callback, pattern=r"^adm:restorenow$"))
     app.add_handler(CallbackQueryHandler(adm_backhome_callback, pattern=r"^adm:backhome$"))
     app.add_handler(CallbackQueryHandler(adm_stats_callback, pattern=r"^adm:stats$"))
     app.add_handler(CallbackQueryHandler(adm_users_callback, pattern=r"^adm:users$"))
