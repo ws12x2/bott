@@ -3618,10 +3618,10 @@ async def backup_database(context: ContextTypes.DEFAULT_TYPE) -> dict:
     backup_chat_id = _get_backup_chat_id()
     if not backup_chat_id:
         logger.warning("Bazani zaxiralash uchun chat topilmadi (baza guruhi ham, admin ham sozlanmagan).")
-        return {"ok": False, "reason": "no_chat", "pinned": False, "posts_count": 0, "chat_id": None}
+        return {"ok": False, "reason": "no_chat", "pinned": False, "posts_count": 0, "chat_id": None, "error": None}
 
     if not os.path.exists(DB_PATH):
-        return {"ok": False, "reason": "no_file", "pinned": False, "posts_count": 0, "chat_id": backup_chat_id}
+        return {"ok": False, "reason": "no_file", "pinned": False, "posts_count": 0, "chat_id": backup_chat_id, "error": None}
 
     previous_backup_message_id = get_setting("last_backup_message_id")
     posts_count = _count_posts_in_db()
@@ -3633,22 +3633,32 @@ async def backup_database(context: ContextTypes.DEFAULT_TYPE) -> dict:
         )
         return {
             "ok": False, "reason": "empty_skip", "pinned": False,
-            "posts_count": posts_count, "chat_id": backup_chat_id,
+            "posts_count": posts_count, "chat_id": backup_chat_id, "error": None,
         }
 
-    try:
-        with open(DB_PATH, "rb") as f:
-            sent = await context.bot.send_document(
-                chat_id=backup_chat_id,
-                document=f,
-                filename="movies_backup.db",
-                caption="🗄 Avtomatik zaxira nusxa (backup) - bu xabarni O'CHIRMANG.",
-            )
-    except Exception:
-        logger.exception("Bazani zaxiralashda (yuklashda) xatolik yuz berdi.")
+    sent = None
+    last_error = None
+    for attempt in range(2):  # 1-urinish + 1-qayta urinish (vaqtinchalik tarmoq xatolari uchun)
+        try:
+            with open(DB_PATH, "rb") as f:
+                sent = await context.bot.send_document(
+                    chat_id=backup_chat_id,
+                    document=f,
+                    filename="movies_backup.db",
+                    caption="🗄 Avtomatik zaxira nusxa (backup) - bu xabarni O'CHIRMANG.",
+                )
+            break
+        except Exception as e:
+            last_error = e
+            if attempt == 0:
+                await asyncio.sleep(2)
+
+    if sent is None:
+        logger.error("Bazani zaxiralashda (yuklashda) xatolik yuz berdi: %s", last_error, exc_info=last_error)
         return {
             "ok": False, "reason": "upload_failed", "pinned": False,
             "posts_count": posts_count, "chat_id": backup_chat_id,
+            "error": str(last_error) if last_error else None,
         }
 
     pinned_ok = False
@@ -3678,13 +3688,13 @@ async def backup_database(context: ContextTypes.DEFAULT_TYPE) -> dict:
 
     return {
         "ok": True, "reason": "success", "pinned": pinned_ok,
-        "posts_count": posts_count, "chat_id": backup_chat_id,
+        "posts_count": posts_count, "chat_id": backup_chat_id, "error": None,
     }
 
 
 async def backup_database_job(context: ContextTypes.DEFAULT_TYPE):
     """
-    `job_queue.run_repeating` orqali har 10 daqiqada chaqiriladigan wrapper.
+    `job_queue.run_repeating` orqali har 1 soatda chaqiriladigan wrapper.
     `backup_database`ni chaqiradi, va agar zaxira YUKLANGAN, lekin PIN
     qilinmagan bo'lsa (ya'ni tiklash ISHLAMAYDIGAN holatda qolsa) - adminga
     darhol ogohlantirish xabari yuboradi. Spam bo'lmasligi uchun, xabar
@@ -3746,6 +3756,8 @@ async def adm_backupnow_callback(update: Update, context: ContextTypes.DEFAULT_T
     if result["ok"]:
         pin_text = "✅ Ha" if result["pinned"] else "❌ Yo'q (MUAMMO - tiklash ishlamaydi!)"
         lines.append(f"PIN qilindi: {pin_text}")
+    elif result.get("error"):
+        lines.append(f"\n⚠️ Texnik tafsilot:\n{result['error']}")
 
     keyboard = [[InlineKeyboardButton("🔙 Orqaga", callback_data="adm:menu")]]
     await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard))
@@ -4186,10 +4198,10 @@ def main():
     # har soatda bir marta tekshiradi (birinchi tekshiruv 30 soniyadan keyin)
     if app.job_queue is not None:
         app.job_queue.run_repeating(vip_expiry_job, interval=3600, first=30)
-        # Bazani har 10 daqiqada avtomatik zaxiralab turadi (Render kabi
+        # Bazani har 1 soatda avtomatik zaxiralab turadi (Render kabi
         # platformalarda doimiy fayl xotirasi bo'lmagani uchun ZARUR -
         # aks holda qayta deploy qilinganda barcha ma'lumot yo'qolib ketadi).
-        app.job_queue.run_repeating(backup_database_job, interval=600, first=60)
+        app.job_queue.run_repeating(backup_database_job, interval=3600, first=60)
     else:
         logger.warning(
             "job_queue mavjud emas - VIP muddati tugaganda avtomatik kanaldan "
